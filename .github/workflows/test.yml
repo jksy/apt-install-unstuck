@@ -122,6 +122,22 @@ jobs:
           # The rest of the list keeps its order behind the new entry.
           sed -n 2p /etc/apt/apt-mirrors.txt | grep -q '^http://azure.archive.ubuntu.com/ubuntu/'
 
+  skip-missing:
+    name: ubuntu-24.04-arm / mirror without ports
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - id: install
+        uses: ./
+        with:
+          packages: cowsay
+          # kernel.org has no ubuntu-ports tree, so it must be skipped, not attempted.
+          mirrors: mirrors.edge.kernel.org archive.ubuntu.com
+      - run: |
+          [ "${{ steps.install.outputs.attempts }}" = 1 ]
+          [ "${{ steps.install.outputs.mirror }}" = http://ports.ubuntu.com/ubuntu-ports ]
+
   container:
     name: container / ${{ matrix.image }}
     strategy:
