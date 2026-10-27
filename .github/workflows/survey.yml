@@ -2,27 +2,18 @@ name: survey
 on:
   push:
     branches: [survey]
-  workflow_dispatch:
 jobs:
   survey:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-26.04-arm]
+        os: [ubuntu-26.04-arm, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - run: |
-          set -x
-          cat /etc/os-release
-          uname -m; dpkg --print-architecture
-          id; sudo -n true && echo sudo-ok
-          ls -la /etc/apt /etc/apt/sources.list.d /etc/apt/apt.conf.d
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/* /etc/apt/apt-mirrors.txt; do
-            echo "===== $f"; cat "$f" || true
+          for u in http://azure.archive.ubuntu.com/ubuntu http://archive.ubuntu.com/ubuntu http://ports.ubuntu.com/ubuntu-ports https://mirrors.edge.kernel.org/ubuntu-ports; do
+            echo "$u: $(curl -s -o /dev/null -w '%{http_code}' $u/dists/noble/main/binary-arm64/Release)"
           done
-          for f in /etc/apt/apt.conf.d/*; do echo "===== $f"; cat "$f"; done
-          apt-config dump | grep -Ei 'Dir|Lock|Acquire|Retries' || true
-          ls -la /var/cache/apt/archives /var/lib/apt/lists | head -50
-          stat -c '%U:%G %a %n' /var/cache/apt/archives/partial /var/lib/apt/lists/partial
-          apt-get --version | head -1
-          which timeout python3; python3 --version
+          time sudo apt-get update 2>&1 | tail -20
+          apt-cache policy | head -20
+          ls /var/lib/apt/lists
