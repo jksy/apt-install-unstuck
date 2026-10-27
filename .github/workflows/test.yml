@@ -1,0 +1,143 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  runner:
+    name: ${{ matrix.os }} / ${{ matrix.scenario }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-26.04-arm]
+        scenario: [default, slow, hang]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Start fake mirror
+        id: fake
+        if: matrix.scenario != 'default'
+        run: |
+          . /etc/os-release
+          if [ "$(dpkg --print-architecture)" != amd64 ] && dpkg --compare-versions "$VERSION_ID" lt 26.04; then
+            upstream=http://ports.ubuntu.com path=/ubuntu-ports
+          else
+            upstream=http://archive.ubuntu.com path=/ubuntu
+          fi
+          nohup python3 tests/slow-mirror.py --mode ${{ matrix.scenario }} --rate 2048 \
+            --upstream "$upstream" --port 8080 >"$RUNNER_TEMP/fake-mirror.log" 2>&1 &
+          for _ in $(seq 20); do curl -s -o /dev/null --max-time 1 http://127.0.0.1:8080/ && break || sleep 0.5; done
+          echo "url=http://127.0.0.1:8080$path" >>"$GITHUB_OUTPUT"
+
+      - name: Snapshot apt state
+        run: sudo find /etc/apt /var/lib/apt/lists -printf '%p %s %T@ %m %u\n' | sort >"$RUNNER_TEMP/before.txt"
+
+      - name: Install (default mirrors)
+        id: default
+        if: matrix.scenario == 'default'
+        uses: ./
+        with:
+          packages: cowsay
+
+      - name: Install (slow mirror first)
+        id: slow
+        if: matrix.scenario == 'slow'
+        uses: ./
+        with:
+          packages: |
+            cowsay
+          mirrors: ${{ steps.fake.outputs.url }} archive.ubuntu.com
+          rounds: 1
+          stall-timeout: 60
+          attempt-timeout: 40
+
+      - name: Install (hanging mirror first)
+        id: hang
+        if: matrix.scenario == 'hang'
+        uses: ./
+        with:
+          packages: cowsay
+          mirrors: ${{ steps.fake.outputs.url }} archive.ubuntu.com
+          rounds: 1
+          stall-timeout: 10
+          attempt-timeout: 300
+
+      - name: Verify
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          FAKE: ${{ steps.fake.outputs.url }}
+          MIRROR: ${{ steps.default.outputs.mirror || steps.slow.outputs.mirror || steps.hang.outputs.mirror }}
+          ATTEMPTS: ${{ steps.default.outputs.attempts || steps.slow.outputs.attempts || steps.hang.outputs.attempts }}
+          DURATION: ${{ steps.default.outputs.duration || steps.slow.outputs.duration || steps.hang.outputs.duration }}
+          RESULTS: ${{ steps.default.outputs.results || steps.slow.outputs.results || steps.hang.outputs.results }}
+        run: |
+          set -x
+          fail() { echo "::error::$*"; exit 1; }
+          dpkg -s cowsay | grep -q '^Status: install ok installed' || fail "cowsay not installed"
+          /usr/games/cowsay ok
+          [ -n "$DURATION" ] || fail "duration output missing"
+          ls -d /tmp/apt-install-unstuck.* 2>/dev/null && fail "temporary directory left behind"
+          case $SCENARIO in
+            default)
+              [ "$MIRROR" = default ] || fail "expected the image mirrors, got $MIRROR"
+              [ "$ATTEMPTS" = 1 ] || fail "expected 1 attempt, got $ATTEMPTS"
+              ;;
+            slow | hang)
+              expected=timeout; [ "$SCENARIO" = hang ] && expected=stalled
+              [ "$ATTEMPTS" = 2 ] || fail "expected 2 attempts, got $ATTEMPTS"
+              [ "$MIRROR" != default ] && [ "$MIRROR" != "$FAKE" ] || fail "unexpected mirror $MIRROR"
+              [ "$RESULTS" = "$FAKE=$expected $MIRROR=ok" ] || fail "unexpected results: $RESULTS"
+              grep -q 'GET\|hanging' "$RUNNER_TEMP/fake-mirror.log" || fail "fake mirror was never contacted"
+              # isolate=true must leave the system apt configuration and lists alone.
+              sudo find /etc/apt /var/lib/apt/lists -printf '%p %s %T@ %m %u\n' | sort >"$RUNNER_TEMP/after.txt"
+              diff -u "$RUNNER_TEMP/before.txt" "$RUNNER_TEMP/after.txt" || fail "/etc/apt or /var/lib/apt/lists changed"
+              ;;
+          esac
+
+      - name: Fake mirror log
+        if: always() && matrix.scenario != 'default'
+        run: tail -n 50 "$RUNNER_TEMP/fake-mirror.log"
+
+  persist:
+    name: ubuntu-24.04 / isolate=false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - id: install
+        uses: ./
+        with:
+          packages: cowsay
+          mirrors: mirrors.edge.kernel.org
+          isolate: false
+      - run: |
+          cat /etc/apt/apt-mirrors.txt
+          [ "$(head -n1 /etc/apt/apt-mirrors.txt)" = "$(printf 'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1')" ]
+          [ "${{ steps.install.outputs.mirror }}" = https://mirrors.edge.kernel.org/ubuntu ]
+          # The rest of the list keeps its order behind the new entry.
+          sed -n 2p /etc/apt/apt-mirrors.txt | grep -q '^http://azure.archive.ubuntu.com/ubuntu/'
+
+  container:
+    name: container / ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['ubuntu:24.04', 'debian:stable-slim']
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - id: install
+        uses: ./
+        with:
+          packages: sl
+          mirrors: default archive.ubuntu.com
+      - run: |
+          dpkg -s sl | grep -q '^Status: install ok installed'
+          [ "${{ steps.install.outputs.mirror }}" = default ]

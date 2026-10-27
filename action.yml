@@ -1,0 +1,82 @@
+name: apt-install-unstuck
+description: apt-get install that detects a stalled Ubuntu mirror, aborts, and retries on another mirror without changing the runner's apt configuration.
+author: Junichiro Kasuya
+branding:
+  icon: download
+  color: orange
+
+inputs:
+  packages:
+    description: Packages to install, separated by spaces or newlines.
+    required: true
+  mirrors:
+    description: >-
+      Mirrors to try in order, separated by spaces. "default" uses the image's own
+      apt configuration; a host name (archive.ubuntu.com, mirrors.edge.kernel.org, ...)
+      or a full URL selects a mirror in an isolated attempt.
+    default: default archive.ubuntu.com mirrors.edge.kernel.org
+  rounds:
+    description: How many times to walk the mirror list.
+    default: "2"
+  stall-timeout:
+    description: Abort an attempt when the download size has not grown for this many seconds.
+    default: "60"
+  attempt-timeout:
+    description: Hard limit in seconds for the network part (update and download) of one attempt.
+    default: "600"
+  install-recommends:
+    description: Install recommended packages.
+    default: "false"
+  lock-timeout:
+    description: Seconds to wait for the dpkg lock (DPkg::Lock::Timeout).
+    default: "120"
+  isolate:
+    description: >-
+      Keep the system apt configuration untouched. When false, the mirror that
+      worked is prepended to /etc/apt/apt-mirrors.txt for later steps.
+    default: "true"
+  extra-sources:
+    description: Keep non-Ubuntu sources (PPAs, packages.microsoft.com, ...) in isolated attempts.
+    default: "false"
+
+outputs:
+  mirror:
+    description: Mirror the packages were installed from ("default" for the image configuration).
+    value: ${{ steps.install.outputs.mirror }}
+  attempts:
+    description: Number of attempts made.
+    value: ${{ steps.install.outputs.attempts }}
+  duration:
+    description: Total time in seconds.
+    value: ${{ steps.install.outputs.duration }}
+  results:
+    description: Result of every attempt as space separated mirror=result pairs.
+    value: ${{ steps.install.outputs.results }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        INPUT_PACKAGES: ${{ inputs.packages }}
+        INPUT_MIRRORS: ${{ inputs.mirrors }}
+        INPUT_ROUNDS: ${{ inputs.rounds }}
+        INPUT_STALL_TIMEOUT: ${{ inputs.stall-timeout }}
+        INPUT_ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
+        INPUT_INSTALL_RECOMMENDS: ${{ inputs.install-recommends }}
+        INPUT_LOCK_TIMEOUT: ${{ inputs.lock-timeout }}
+        INPUT_ISOLATE: ${{ inputs.isolate }}
+        INPUT_EXTRA_SOURCES: ${{ inputs.extra-sources }}
+      run: |
+        read -d '' -ra packages <<<"$INPUT_PACKAGES" || true
+        "$GITHUB_ACTION_PATH/apt-install.sh" \
+          --mirrors "$INPUT_MIRRORS" \
+          --rounds "$INPUT_ROUNDS" \
+          --stall-timeout "$INPUT_STALL_TIMEOUT" \
+          --attempt-timeout "$INPUT_ATTEMPT_TIMEOUT" \
+          --install-recommends "$INPUT_INSTALL_RECOMMENDS" \
+          --lock-timeout "$INPUT_LOCK_TIMEOUT" \
+          --isolate "$INPUT_ISOLATE" \
+          --extra-sources "$INPUT_EXTRA_SOURCES" \
+          -- "${packages[@]}"
