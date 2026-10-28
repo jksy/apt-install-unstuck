@@ -15,12 +15,16 @@ notion of "too slow" and waits, so a job that normally installs packages in
 ## Usage
 
 ```yaml
-- uses: jksy/apt-install-unstuck@v1
+- uses: jksy/apt-install-unstuck@v0
 - run: sudo apt-get update && sudo apt-get install -y ghostscript imagemagick
 ```
 
 Every `apt-get` after the action, in any later step of the job, downloads Ubuntu
 packages through the proxy. To stop using it, remove the step.
+
+`@v0` follows the latest 0.x release. While the major version is 0, a minor
+release may change inputs or behaviour; pin a full version such as `@v0.1.0` to
+avoid that.
 
 ## How it works
 
@@ -124,7 +128,7 @@ steps:
     with:
       role-to-assume: arn:aws:iam::123456789012:role/apt-cache
       aws-region: ap-northeast-1
-  - uses: jksy/apt-install-unstuck@v1
+  - uses: jksy/apt-install-unstuck@v0
     with:
       cache: s3://my-apt-cache/apt
   - run: sudo apt-get update && sudo apt-get install -y ghostscript
@@ -133,7 +137,7 @@ steps:
 ### Cloudflare R2
 
 ```yaml
-  - uses: jksy/apt-install-unstuck@v1
+  - uses: jksy/apt-install-unstuck@v0
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -200,7 +204,7 @@ R2 offers the same rules under the bucket's *Object lifecycle rules* settings.
       path: ~/.cache/apt-unstuck
       key: apt-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
       restore-keys: apt-${{ runner.os }}-${{ runner.arch }}-
-  - uses: jksy/apt-install-unstuck@v1
+  - uses: jksy/apt-install-unstuck@v0
     with:
       cache: ~/.cache/apt-unstuck
   - run: sudo apt-get update && sudo apt-get install -y ghostscript
@@ -216,7 +220,7 @@ proxy explicitly:
 
 ```yaml
   - id: apt
-    uses: jksy/apt-install-unstuck@v1
+    uses: jksy/apt-install-unstuck@v0
     with:
       listen: 0.0.0.0:3142
   - run: |
