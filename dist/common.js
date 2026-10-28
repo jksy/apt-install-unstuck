@@ -102,7 +102,7 @@ function report(statsFile) {
     ['From upstream', fmtBytes(s.bytes_from_upstream)],
     ['Cache writes', `${s.cache_writes} (${s.cache_write_errors} failed)`],
   ];
-  let md = '### apt-install-unstuck\n\n| | |\n|---|---:|\n';
+  let md = '### apt-install-unstuck\n\n| Metric | Value |\n|---|---:|\n';
   md += rows.map(([k, v]) => `| ${k} | ${v} |`).join('\n') + '\n';
   const mirrors = Object.entries(s.mirrors || {});
   if (mirrors.length) {
