@@ -348,6 +348,13 @@ async fn health_and_unsupported_methods() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    let resp = direct
+        .get(format!("{}/_stats", proxy.url()))
+        .send()
+        .await
+        .unwrap();
+    let stats: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(stats["hits"], 0);
 
     let resp = proxy.client().post(deb_url()).send().await.unwrap();
     assert_eq!(resp.status(), 405);

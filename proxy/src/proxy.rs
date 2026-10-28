@@ -143,13 +143,23 @@ pub async fn handle(app: Arc<App>, req: Request<Incoming>) -> Response<Body> {
         );
     }
     if req.uri().scheme().is_none() {
-        return if req.uri().path() == "/_health" {
-            full(StatusCode::OK, "ok\n")
-        } else {
-            full(
+        return match req.uri().path() {
+            "/_health" => full(StatusCode::OK, "ok\n"),
+            // Current counters, for callers that keep the proxy running.
+            "/_stats" => {
+                let json = serde_json::to_vec_pretty(&app.stats.snapshot()).unwrap_or_default();
+                let mut r =
+                    Response::new(Full::new(Bytes::from(json)).map_err(|e| match e {}).boxed());
+                r.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                r
+            }
+            _ => full(
                 StatusCode::BAD_REQUEST,
                 "expected an absolute-form proxy request\n",
-            )
+            ),
         };
     }
     match archive::match_request(req.uri()) {

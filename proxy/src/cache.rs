@@ -3,11 +3,15 @@
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use object_store::aws::AmazonS3Builder;
+use std::time::Duration;
+
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::buffered::BufWriter;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt};
+use object_store::{
+    ClientConfigKey, GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, RetryConfig,
+};
 use tokio::io::AsyncWriteExt;
 
 /// Namespace reserved for hosts that are not described in the archive table.
@@ -29,7 +33,20 @@ impl Cache {
             if bucket.is_empty() {
                 bail!("missing bucket name in `{spec}`");
             }
-            let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+            // A cache that cannot be reached must not hold up apt for long:
+            // keep retries short and fall back to upstream on errors.
+            let retry = RetryConfig {
+                max_retries: 2,
+                retry_timeout: Duration::from_secs(15),
+                ..Default::default()
+            };
+            let mut builder = AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .with_retry(retry)
+                .with_config(
+                    AmazonS3ConfigKey::Client(ClientConfigKey::ConnectTimeout),
+                    "5 seconds",
+                );
             let endpoint = ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL", "AWS_ENDPOINT"]
                 .iter()
                 .find_map(|k| std::env::var(k).ok());

@@ -16,7 +16,7 @@ jobs:
       run:
         working-directory: proxy
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -26,3 +26,152 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  # Static musl binaries, built the same way as in release.yml.
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: proxy
+          key: musl
+      - uses: mlugg/setup-zig@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - working-directory: proxy
+        run: cargo zigbuild --release --locked --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
+      - uses: actions/upload-artifact@v7
+        with:
+          name: unstuck-proxy-x86_64
+          path: proxy/target/x86_64-unknown-linux-musl/release/unstuck-proxy
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: unstuck-proxy-aarch64
+          path: proxy/target/aarch64-unknown-linux-musl/release/unstuck-proxy
+          if-no-files-found: error
+
+  e2e:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-26.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    services:
+      minio:
+        image: bitnamilegacy/minio:latest
+        ports: ['9000:9000']
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: apt-cache
+    env:
+      DEAD_MIRRORS: ubuntu=http://127.0.0.1:9/ubuntu/;ubuntu-ports=http://127.0.0.1:9/ubuntu-ports/
+      SLOW_MIRRORS: ubuntu=http://127.0.0.1:8081/ubuntu/,origin;ubuntu-ports=http://127.0.0.1:8081/ubuntu-ports/,origin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: unstuck-proxy-${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+          path: ${{ runner.temp }}/bin
+      - name: Use the prebuilt proxy
+        run: |
+          chmod +x "$RUNNER_TEMP/bin/unstuck-proxy"
+          echo "UNSTUCK_PROXY_BIN=$RUNNER_TEMP/bin/unstuck-proxy" >> "$GITHUB_ENV"
+      - name: Show apt sources
+        run: |
+          grep -rhE '^(deb|URIs|Types|Suites)' /etc/apt/sources.list /etc/apt/sources.list.d/ || true
+          cat /etc/apt/apt-mirrors.txt 2>/dev/null || true
+
+      # 1. Plain install without a cache.
+      - id: plain
+        uses: ./
+        with:
+          packages: ghostscript
+      - name: Check plain install went through the proxy
+        run: |
+          gs --version
+          test "${{ steps.plain.outputs.cache-misses }}" -gt 0
+
+      # 3. Fill an S3 (MinIO) cache, then install again with every mirror unreachable.
+      - name: Wait for MinIO bucket
+        run: |
+          for i in $(seq 60); do
+            curl -sf -I --user minioadmin:minioadmin --aws-sigv4 aws:amz:us-east-1:s3 \
+              http://127.0.0.1:9000/apt-cache && exit 0
+            sleep 1
+          done
+          exit 1
+      - id: fill
+        uses: ./
+        env: &minio
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://127.0.0.1:9000
+        with:
+          packages: sl figlet
+          cache: s3://apt-cache/e2e
+      - name: Check the cache was filled
+        run: test "${{ steps.fill.outputs.cache-misses }}" -gt 0
+      - id: offline
+        uses: ./
+        env: *minio
+        with:
+          cache: s3://apt-cache/e2e
+          mirrors: ${{ env.DEAD_MIRRORS }}
+          rounds: 1
+          keep-running: true
+      - name: Reinstall from the cache only
+        env:
+          PROXY: ${{ steps.offline.outputs.proxy-url }}
+        run: |
+          opts=(-o "Acquire::http::Proxy=$PROXY" -o Acquire::Retries=0)
+          sudo apt-get clean
+          sudo apt-get "${opts[@]}" update
+          sudo apt-get "${opts[@]}" install --reinstall -y --no-install-recommends sl figlet
+          curl -sf "$PROXY/_stats" | tee stats.json
+          jq -e '.hits > 0 and .stale > 0' stats.json
+
+      # 2. A slow mirror in front of the origin: the proxy has to switch away from it.
+      - name: Start slow mirror
+        run: |
+          nohup python3 .github/e2e/slow-mirror.py 8081 2048 > "$RUNNER_TEMP/slow-mirror.log" 2>&1 &
+          for i in $(seq 20); do curl -s -o /dev/null http://127.0.0.1:8081/ && exit 0; sleep 0.5; done
+          exit 1
+      - id: slow
+        uses: ./
+        with:
+          packages: cowsay
+          mirrors: ${{ env.SLOW_MIRRORS }}
+          stall-timeout: 3
+      - name: Check the proxy switched mirrors
+        run: |
+          /usr/games/cowsay ok
+          test "${{ steps.slow.outputs.failovers }}" -gt 0
+      - if: always()
+        run: cat "$RUNNER_TEMP/slow-mirror.log" || true
+
+  # Without a release for the ref, the action builds the proxy with cargo.
+  e2e-build-from-source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: proxy
+          key: action-build
+      - id: install
+        uses: ./
+        with:
+          packages: sl
+      - run: |
+          /usr/games/sl -h 2>/dev/null || test -x /usr/games/sl
+          test "${{ steps.install.outputs.cache-misses }}" -gt 0

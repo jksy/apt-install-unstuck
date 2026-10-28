@@ -1,0 +1,78 @@
+name: apt-install-unstuck
+description: Install apt packages through a local proxy that switches Ubuntu mirrors when downloads stall, with an optional S3 cache.
+author: Junichiro Kasuya
+branding:
+  icon: download-cloud
+  color: orange
+
+inputs:
+  packages:
+    description: Packages to install, separated by whitespace. When empty, only the proxy is started.
+    required: false
+    default: ''
+  cache:
+    description: '`none`, `s3://bucket/prefix`, or a local directory (for use with actions/cache).'
+    required: false
+    default: none
+  cache-key-prefix:
+    description: Key prefix inside the cache. Defaults to `${ImageOS}-${ImageVersion}-${arch}`.
+    required: false
+    default: ''
+  mirrors:
+    description: 'Upstreams per archive, e.g. `ubuntu=origin,http://archive.ubuntu.com/ubuntu/;ubuntu-ports=...`. `origin` is the host from the apt sources; a list replaces the defaults.'
+    required: false
+    default: ''
+  min-rate:
+    description: Minimum transfer rate in bytes/s (K and M suffixes are KiB and MiB).
+    required: false
+    default: 50K
+  stall-timeout:
+    description: Seconds below min-rate before switching to the next mirror.
+    required: false
+    default: '20'
+  rounds:
+    description: How many times to go through the mirror list.
+    required: false
+    default: '2'
+  update:
+    description: Run `apt-get update` before installing.
+    required: false
+    default: 'true'
+  install-recommends:
+    description: Install recommended packages.
+    required: false
+    default: 'false'
+  lock-timeout:
+    description: Seconds to wait for the dpkg lock (`DPkg::Lock::Timeout`).
+    required: false
+    default: '120'
+  attempt-timeout:
+    description: Upper bound in seconds for each apt-get command.
+    required: false
+    default: '900'
+  keep-running:
+    description: Keep the proxy running until the end of the job so later steps can use `proxy-url`.
+    required: false
+    default: 'false'
+  listen:
+    description: Address for the proxy to listen on. Use e.g. `0.0.0.0:0` or the docker bridge address to reach it from containers.
+    required: false
+    default: 127.0.0.1:0
+
+outputs:
+  proxy-url:
+    description: URL of the running proxy (with keep-running).
+  proxy-port:
+    description: Port the proxy listens on.
+  cache-hits:
+    description: Requests served from the cache.
+  cache-misses:
+    description: Requests fetched from upstream mirrors.
+  failovers:
+    description: Times the proxy switched to another mirror.
+
+runs:
+  using: node24
+  main: dist/main.js
+  post: dist/post.js
+  post-if: always()
