@@ -1,0 +1,48 @@
+name: apt-install-unstuck
+description: Keep apt-get from hanging on a stalled Ubuntu mirror. Routes later apt commands through a local proxy that switches mirrors, with an optional S3 cache.
+author: Junichiro Kasuya
+branding:
+  icon: download-cloud
+  color: orange
+
+inputs:
+  cache:
+    description: '`none`, `s3://bucket/prefix`, or a local directory (for use with actions/cache).'
+    required: false
+    default: none
+  cache-key-prefix:
+    description: Key prefix inside the cache. Defaults to `${ImageOS}-${ImageVersion}-${arch}`.
+    required: false
+    default: ''
+  mirrors:
+    description: 'Upstreams per archive, e.g. `ubuntu=origin,http://archive.ubuntu.com/ubuntu/;ubuntu-ports=...`. `origin` is the host from the apt sources; a list replaces the defaults.'
+    required: false
+    default: ''
+  min-rate:
+    description: Minimum transfer rate in bytes/s (K and M suffixes are KiB and MiB).
+    required: false
+    default: 50K
+  stall-timeout:
+    description: Seconds below min-rate before switching to the next mirror.
+    required: false
+    default: '20'
+  rounds:
+    description: How many times to go through the mirror list.
+    required: false
+    default: '2'
+  listen:
+    description: Address for the proxy to listen on. Use e.g. `0.0.0.0:3142` or the docker bridge address to reach it from containers.
+    required: false
+    default: 127.0.0.1:0
+
+outputs:
+  proxy-url:
+    description: URL of the running proxy, for tools that do not read the apt configuration (e.g. docker build).
+  proxy-port:
+    description: Port the proxy listens on.
+
+runs:
+  using: node24
+  main: dist/main.js
+  post: dist/post.js
+  post-if: always()
