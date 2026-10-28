@@ -204,6 +204,8 @@ async function run() {
     if (packages.length) {
       const opts = [
         '-o', `Acquire::http::Proxy=${proxy.url}`,
+        // apt would otherwise send HTTPS sources to the same proxy via CONNECT.
+        '-o', 'Acquire::https::Proxy=DIRECT',
         '-o', `DPkg::Lock::Timeout=${lockTimeout}`,
         '-o', 'Acquire::Retries=3',
       ];

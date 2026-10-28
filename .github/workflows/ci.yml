@@ -65,6 +65,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     services:
+      # TODO: stopgap. minio/minio images are no longer published (the repo is
+      # archived and AIStor Free needs a license key). Replace with another
+      # S3-compatible server.
       minio:
         image: bitnamilegacy/minio:latest
         ports: ['9000:9000']
@@ -104,8 +107,7 @@ jobs:
       - name: Wait for MinIO bucket
         run: |
           for i in $(seq 60); do
-            curl -sf -I --user minioadmin:minioadmin --aws-sigv4 aws:amz:us-east-1:s3 \
-              http://127.0.0.1:9000/apt-cache && exit 0
+            docker exec "${{ job.services.minio.id }}" mc ls local/apt-cache > /dev/null 2>&1 && exit 0
             sleep 1
           done
           exit 1
@@ -133,7 +135,7 @@ jobs:
         env:
           PROXY: ${{ steps.offline.outputs.proxy-url }}
         run: |
-          opts=(-o "Acquire::http::Proxy=$PROXY" -o Acquire::Retries=0)
+          opts=(-o "Acquire::http::Proxy=$PROXY" -o Acquire::https::Proxy=DIRECT -o Acquire::Retries=0)
           sudo apt-get clean
           sudo apt-get "${opts[@]}" update
           sudo apt-get "${opts[@]}" install --reinstall -y --no-install-recommends sl figlet
