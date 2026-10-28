@@ -27,6 +27,25 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  # The Node.js side of the action: unit tests, and the lookup of the release
+  # for a commit SHA against the real API and release assets.
+  action:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: node --test test/*.test.js
+      - name: Resolve a released commit SHA to its binary
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/tags" \
+            --jq '[.[] | select(.name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].commit.sha')
+          test -n "$sha"
+          node .github/e2e/resolve-sha.js "$GITHUB_REPOSITORY" "$sha"
+
   # Static musl binaries, built the same way as in release.yml.
   build:
     runs-on: ubuntu-24.04
