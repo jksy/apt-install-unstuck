@@ -40,6 +40,9 @@ pub struct Snapshot {
     pub cache_writes: u64,
     pub cache_write_errors: u64,
     pub mirrors: BTreeMap<String, MirrorStats>,
+    /// Downloads and cache writes still running (only reported by `/_stats`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<usize>,
 }
 
 impl Stats {
@@ -66,6 +69,7 @@ impl Stats {
             cache_writes: self.cache_writes.load(Relaxed),
             cache_write_errors: self.cache_write_errors.load(Relaxed),
             mirrors: self.mirrors.lock().unwrap().clone(),
+            in_flight: None,
         }
     }
 }

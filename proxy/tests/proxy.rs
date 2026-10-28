@@ -368,3 +368,74 @@ async fn health_and_unsupported_methods() {
     assert_eq!(&buf, b"HTTP/1.1 405");
     proxy.stop();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn if_modified_since_gets_304_for_unchanged_mutable_files() {
+    let release = content(3_000, 9);
+    let deb = content(3_000, 10);
+    let mirror =
+        FakeMirror::start(Mode::Normal, files(&[(IN_RELEASE, &release), (DEB, &deb)])).await;
+    let m = mirrors(&[mirror.base("/ubuntu/")]);
+    let proxy = Proxy::start(&args(&["--mirrors", &m]));
+    let client = proxy.client();
+    let url = format!("http://archive.ubuntu.com/ubuntu/{IN_RELEASE}");
+
+    let resp = client
+        .get(&url)
+        .header("if-modified-since", common::LAST_MODIFIED)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 304);
+    assert_eq!(resp.headers()["last-modified"], common::LAST_MODIFIED);
+    assert!(resp.bytes().await.unwrap().is_empty());
+
+    let older = "Mon, 01 Jan 2024 00:00:00 GMT";
+    let resp = client
+        .get(&url)
+        .header("if-modified-since", older)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap(), release);
+
+    // Immutable files ignore the condition.
+    let resp = client
+        .get(deb_url())
+        .header("if-modified-since", common::LAST_MODIFIED)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap(), deb);
+    proxy.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apt_detect_sends_only_archives_to_a_healthy_proxy() {
+    let detect = |proxy: &str, url: &str| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_unstuck-proxy"))
+            .args(["apt-detect", "--proxy", proxy, url])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let archive = "http://azure.archive.ubuntu.com/ubuntu/dists/noble/InRelease";
+    let ppa = "http://ppa.launchpadcontent.net/git-core/ppa/ubuntu/dists/noble/InRelease";
+
+    let proxy = Proxy::start(&[]);
+    let addr = proxy.addr.clone();
+    assert_eq!(detect(&addr, archive), format!("http://{addr}"));
+    assert_eq!(
+        detect(
+            &addr,
+            "http://ports.ubuntu.com/ubuntu-ports/pool/main/x.deb"
+        ),
+        format!("http://{addr}")
+    );
+    assert_eq!(detect(&addr, ppa), "DIRECT");
+    proxy.stop();
+    assert_eq!(detect(&addr, archive), "DIRECT");
+}

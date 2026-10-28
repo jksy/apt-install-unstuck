@@ -5,12 +5,12 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 use std::time::Duration;
 
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::aws::AmazonS3Builder;
 use object_store::buffered::BufWriter;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
-    ClientConfigKey, GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, RetryConfig,
+    Certificate, ClientOptions, GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, RetryConfig,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -40,19 +40,22 @@ impl Cache {
                 retry_timeout: Duration::from_secs(15),
                 ..Default::default()
             };
-            let mut builder = AmazonS3Builder::from_env()
-                .with_bucket_name(bucket)
-                .with_retry(retry)
-                .with_config(
-                    AmazonS3ConfigKey::Client(ClientConfigKey::ConnectTimeout),
-                    "5 seconds",
-                );
             let endpoint = ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL", "AWS_ENDPOINT"]
                 .iter()
                 .find_map(|k| std::env::var(k).ok());
-            if endpoint.is_some_and(|e| e.starts_with("http://")) {
-                builder = builder.with_allow_http(true);
-            }
+            let allow_http = endpoint.is_some_and(|e| e.starts_with("http://"))
+                || std::env::var("AWS_ALLOW_HTTP").is_ok_and(|v| v == "true");
+            // Bundled roots in addition to the system's, for containers without ca-certificates.
+            let client = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .filter_map(|c| Certificate::from_der(c).ok())
+                .fold(ClientOptions::new(), ClientOptions::with_root_certificate)
+                .with_connect_timeout(Duration::from_secs(5))
+                .with_allow_http(allow_http);
+            let builder = AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .with_retry(retry)
+                .with_client_options(client);
             (
                 Arc::new(builder.build().context("configuring S3 cache")?),
                 root,

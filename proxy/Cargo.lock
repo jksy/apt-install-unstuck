@@ -1698,6 +1698,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "webpki-root-certs",
 ]
 
 [[package]]

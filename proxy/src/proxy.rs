@@ -147,7 +147,9 @@ pub async fn handle(app: Arc<App>, req: Request<Incoming>) -> Response<Body> {
             "/_health" => full(StatusCode::OK, "ok\n"),
             // Current counters, for callers that keep the proxy running.
             "/_stats" => {
-                let json = serde_json::to_vec_pretty(&app.stats.snapshot()).unwrap_or_default();
+                let mut snapshot = app.stats.snapshot();
+                snapshot.in_flight = Some(app.tracker.len());
+                let json = serde_json::to_vec_pretty(&snapshot).unwrap_or_default();
                 let mut r =
                     Response::new(Full::new(Bytes::from(json)).map_err(|e| match e {}).boxed());
                 r.headers_mut().insert(
@@ -218,6 +220,12 @@ async fn handle_archive(
         return head_archive(app, &ar, upstreams, store_key, log).await;
     }
 
+    // Upstream is always asked for the whole file so the cache stays fresh;
+    // the client's condition is evaluated here instead.
+    let if_modified_since = match ar.class {
+        FileClass::Immutable => None,
+        _ => req.headers().get(header::IF_MODIFIED_SINCE).cloned(),
+    };
     let job = FetchJob {
         key: key.clone(),
         upstreams,
@@ -257,6 +265,16 @@ async fn handle_archive(
                 h.insert(header::LAST_MODIFIED, v.clone());
             }
             h.insert(CACHE_HEADER, HeaderValue::from_static("miss"));
+            if not_modified(if_modified_since.as_ref(), head.last_modified.as_ref()) {
+                // The download keeps running in the background to refresh the cache.
+                *r.status_mut() = StatusCode::NOT_MODIFIED;
+                r.headers_mut().remove(header::CONTENT_LENGTH);
+                let s = inflight.state.borrow();
+                log.mirror = s.mirror.clone().unwrap_or_else(|| "-".into());
+                log.failovers = s.failovers;
+                log.emit(304, 0, None);
+                return r;
+            }
             *r.body_mut() = channel_body(move |tx| async move {
                 let (n, res) = fetch::follow(inflight.clone(), tx).await;
                 {
@@ -428,6 +446,19 @@ async fn head_archive(
     log.result = "error";
     log.emit(502, 0, Some(&last_error));
     full(StatusCode::BAD_GATEWAY, "")
+}
+
+/// True when the client's copy (If-Modified-Since) is at least as new as upstream's.
+fn not_modified(
+    if_modified_since: Option<&HeaderValue>,
+    last_modified: Option<&HeaderValue>,
+) -> bool {
+    let parse =
+        |v: Option<&HeaderValue>| v.and_then(|v| httpdate::parse_http_date(v.to_str().ok()?).ok());
+    match (parse(if_modified_since), parse(last_modified)) {
+        (Some(since), Some(modified)) => modified <= since,
+        _ => false,
+    }
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {

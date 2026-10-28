@@ -1,5 +1,6 @@
 mod archive;
 mod cache;
+mod detect;
 mod fetch;
 mod proxy;
 mod rate;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -28,8 +29,28 @@ use crate::proxy::App;
 /// HTTP forward proxy that keeps apt downloads moving by switching Ubuntu
 /// mirrors when one stalls, with an optional shared cache.
 #[derive(Parser)]
-#[command(version)]
+#[command(version, args_conflicts_with_subcommands = true)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Print the proxy apt should use for URL, or DIRECT. Meant for
+    /// `Acquire::http::Proxy-Auto-Detect`; always exits 0.
+    AptDetect {
+        /// Address of the running proxy, e.g. 127.0.0.1:3142.
+        #[arg(long)]
+        proxy: String,
+        url: String,
+    },
+}
+
+#[derive(Args)]
+struct ServeArgs {
     /// Address to listen on. Port 0 picks a free port.
     #[arg(long, default_value = "127.0.0.1:0")]
     listen: SocketAddr,
@@ -96,9 +117,18 @@ fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    match cli.command {
+        Some(Command::AptDetect { proxy, url }) => {
+            detect::run(&proxy, &url);
+            Ok(())
+        }
+        None => tokio::runtime::Runtime::new()?.block_on(serve(cli.serve)),
+    }
+}
+
+async fn serve(cli: ServeArgs) -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let fetch = FetchConfig {
@@ -108,7 +138,15 @@ async fn main() -> anyhow::Result<()> {
         rounds: cli.rounds.max(1),
     };
     let user_agent = concat!("unstuck-proxy/", env!("CARGO_PKG_VERSION"));
+    // Bundled roots on top of the system's, so the proxy also starts in
+    // containers without ca-certificates (mirrors are plain HTTP anyway).
+    let roots = || {
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .filter_map(|c| reqwest::Certificate::from_der(c).ok())
+    };
     let mirror_client = reqwest::Client::builder()
+        .tls_certs_merge(roots())
         .no_proxy()
         .user_agent(user_agent)
         .connect_timeout(fetch.first_byte_timeout)
@@ -116,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()?;
     let passthrough_client = reqwest::Client::builder()
+        .tls_certs_merge(roots())
         .no_proxy()
         .connect_timeout(fetch.first_byte_timeout)
         .tcp_keepalive(Duration::from_secs(30))
