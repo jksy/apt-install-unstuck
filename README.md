@@ -26,6 +26,11 @@ packages through the proxy. To stop using it, remove the step.
 release may change inputs or behaviour; pin a full version such as `@v0.1.0` to
 avoid that.
 
+Pinning to a commit SHA (`@<sha> # v0.1.0`, as Dependabot and Renovate do)
+works as well: the action looks up which release the commit belongs to and
+downloads that release's binary. The lookup uses the `token` input, which
+defaults to `${{ github.token }}`.
+
 ## How it works
 
 The action starts a small HTTP forward proxy (`unstuck-proxy`, written in Rust)
@@ -80,6 +85,7 @@ fail the step instead.
 | `stall-timeout` | `20` | Seconds below `min-rate` before switching mirrors. |
 | `rounds` | `2` | How many times to go through the mirror list. |
 | `listen` | `127.0.0.1:0` | Address the proxy listens on (port 0 picks a free port). |
+| `token` | `${{ github.token }}` | Token for looking up the release of a commit SHA (`contents: read`). |
 | `fail-on-error` | `false` | Fail the step when the proxy cannot be set up, instead of continuing without it. |
 
 ### Outputs
@@ -283,9 +289,11 @@ cargo test
 truncating, 404, no Range support). The E2E workflow in `.github/workflows/ci.yml`
 exercises the action on Ubuntu 22.04, 24.04 and 26.04 for x64 and arm64.
 
-When the action is used from a ref that has no release (a branch or commit SHA),
-it builds the proxy with `cargo`. Releases are created by pushing a `vX.Y.Z` tag;
-the release workflow also moves the `vX` tag and its release.
+When the action is used from a ref that has no release (a branch, or a commit
+that no release tag points at), it builds the proxy with `cargo`. Releases are
+created by pushing a `vX.Y.Z` tag; the release workflow also moves the `vX` tag
+and its release. `node --test test/*.test.js` runs the tests of the action's
+Node.js side.
 
 ## License
 

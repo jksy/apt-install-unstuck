@@ -7,58 +7,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
-const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const c = require('./common');
+const release = require('./release');
 
 const ACTION_ROOT = path.resolve(__dirname, '..');
-const ARCH = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
 
 function tempRoot() {
   return process.env.RUNNER_TEMP || os.tmpdir();
-}
-
-async function fetchWithRetry(url) {
-  let lastError;
-  for (let i = 0; i < 3; i++) {
-    try {
-      const r = await fetch(url, { redirect: 'follow' });
-      if (r.ok || r.status === 404) return r;
-      lastError = new Error(`${url}: HTTP ${r.status}`);
-    } catch (e) {
-      lastError = e;
-    }
-    await c.sleep(2000 * (i + 1));
-  }
-  throw lastError;
-}
-
-// Downloads the release binary for the action's own ref. Returns null when
-// that ref has no release (a branch or commit), so the caller can build instead.
-async function downloadRelease(repo, ref) {
-  const server = process.env.GITHUB_SERVER_URL || 'https://github.com';
-  const base = `${server}/${repo}/releases/download/${encodeURIComponent(ref)}`;
-  const asset = `unstuck-proxy-${ARCH}-linux`;
-  const sums = await fetchWithRetry(`${base}/SHA256SUMS`);
-  if (sums.status === 404) return null;
-  const expected = (await sums.text())
-    .split('\n')
-    .map((l) => l.trim().split(/\s+/))
-    .find((f) => f[1] && f[1].replace(/^\*/, '') === asset);
-  if (!expected) throw new Error(`SHA256SUMS of ${ref} has no entry for ${asset}`);
-  const bin = await fetchWithRetry(`${base}/${asset}`);
-  if (bin.status === 404) throw new Error(`release ${ref} has no ${asset}`);
-  const data = Buffer.from(await bin.arrayBuffer());
-  const actual = crypto.createHash('sha256').update(data).digest('hex');
-  if (actual !== expected[0].toLowerCase()) {
-    throw new Error(`checksum mismatch for ${asset}: expected ${expected[0]}, got ${actual}`);
-  }
-  const dir = path.join(tempRoot(), 'unstuck-proxy-bin', ref.replace(/[^\w.-]/g, '_'));
-  fs.mkdirSync(dir, { recursive: true });
-  const dest = path.join(dir, 'unstuck-proxy');
-  fs.writeFileSync(dest, data, { mode: 0o755 });
-  console.log(`Downloaded ${asset} from release ${ref} (sha256 ${actual})`);
-  return dest;
 }
 
 function buildFromSource() {
@@ -74,11 +30,10 @@ function buildFromSource() {
 async function resolveBinary() {
   // Escape hatch for testing this action with a prebuilt binary.
   if (process.env.UNSTUCK_PROXY_BIN) return path.resolve(process.env.UNSTUCK_PROXY_BIN);
-  if (!ARCH) throw new Error(`unsupported architecture ${process.arch}`);
   const repo = process.env.GITHUB_ACTION_REPOSITORY;
   const ref = process.env.GITHUB_ACTION_REF;
   if (repo && ref) {
-    const bin = await downloadRelease(repo, ref);
+    const bin = await release.downloadForRef(repo, ref, { token: c.input('token') });
     if (bin) return bin;
     console.log(`No release for ${repo}@${ref}; building from source`);
   }
