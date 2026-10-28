@@ -76,6 +76,10 @@ jobs:
           MINIO_ROOT_PASSWORD: minioadmin
           MINIO_DEFAULT_BUCKETS: apt-cache
     env:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://127.0.0.1:9000
       DEAD_MIRRORS: ubuntu=http://127.0.0.1:9/ubuntu/;ubuntu-ports=http://127.0.0.1:9/ubuntu-ports/
       SLOW_MIRRORS: ubuntu=http://127.0.0.1:8081/ubuntu/,origin;ubuntu-ports=http://127.0.0.1:8081/ubuntu-ports/,origin
     steps:
@@ -92,18 +96,6 @@ jobs:
         run: |
           grep -rhE '^(deb|URIs|Types|Suites)' /etc/apt/sources.list /etc/apt/sources.list.d/ || true
           cat /etc/apt/apt-mirrors.txt 2>/dev/null || true
-
-      # 1. Plain install without a cache.
-      - id: plain
-        uses: ./
-        with:
-          packages: ghostscript
-      - name: Check plain install went through the proxy
-        run: |
-          gs --version
-          test "${{ steps.plain.outputs.cache-misses }}" -gt 0
-
-      # 3. Fill an S3 (MinIO) cache, then install again with every mirror unreachable.
       - name: Wait for MinIO bucket
         run: |
           for i in $(seq 60); do
@@ -111,58 +103,69 @@ jobs:
             sleep 1
           done
           exit 1
-      - id: fill
-        uses: ./
-        env: &minio
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_REGION: us-east-1
-          AWS_ENDPOINT_URL: http://127.0.0.1:9000
-        with:
-          packages: sl figlet
-          cache: s3://apt-cache/e2e
-      - name: Check the cache was filled
-        run: test "${{ steps.fill.outputs.cache-misses }}" -gt 0
-      - id: offline
-        uses: ./
-        env: *minio
-        with:
-          cache: s3://apt-cache/e2e
-          mirrors: ${{ env.DEAD_MIRRORS }}
-          rounds: 1
-          keep-running: true
-      - name: Reinstall from the cache only
-        env:
-          PROXY: ${{ steps.offline.outputs.proxy-url }}
-        run: |
-          opts=(-o "Acquire::http::Proxy=$PROXY" -o Acquire::https::Proxy=DIRECT -o Acquire::Retries=0)
-          sudo apt-get clean
-          sudo apt-get "${opts[@]}" update
-          sudo apt-get "${opts[@]}" install --reinstall -y --no-install-recommends sl figlet
-          curl -sf "$PROXY/_stats" | tee stats.json
-          jq -e '.hits > 0 and .stale > 0' stats.json
-
-      # 2. A slow mirror in front of the origin: the proxy has to switch away from it.
       - name: Start slow mirror
         run: |
           nohup python3 .github/e2e/slow-mirror.py 8081 2048 > "$RUNNER_TEMP/slow-mirror.log" 2>&1 &
           for i in $(seq 20); do curl -s -o /dev/null http://127.0.0.1:8081/ && exit 0; sleep 0.5; done
           exit 1
-      - id: slow
+
+      # A slow mirror sits in front of the origin, so the proxy has to switch
+      # away from it; downloads also fill the S3 (MinIO) cache.
+      - id: unstuck
         uses: ./
         with:
-          packages: cowsay
+          cache: s3://apt-cache/e2e
+          cache-key-prefix: e2e
           mirrors: ${{ env.SLOW_MIRRORS }}
           stall-timeout: 3
-      - name: Check the proxy switched mirrors
-        run: |
-          /usr/games/cowsay ok
-          test "${{ steps.slow.outputs.failovers }}" -gt 0
-      - if: always()
-        run: cat "$RUNNER_TEMP/slow-mirror.log" || true
+      - id: again
+        uses: ./
+      - name: Check the second call reused the proxy
+        run: test "${{ steps.again.outputs.proxy-url }}" = "${{ steps.unstuck.outputs.proxy-url }}"
 
-  # Without a release for the ref, the action builds the proxy with cargo.
-  e2e-build-from-source:
+      - name: Install with unchanged apt commands
+        run: |
+          sudo apt-get update 2>&1 | tee "$RUNNER_TEMP/update.log"
+          if grep -q 'Invalid response from proxy' "$RUNNER_TEMP/update.log"; then
+            echo "::error::a request that should have gone DIRECT reached the proxy"
+            exit 1
+          fi
+          sudo apt-get install -y ghostscript
+          gs --version
+      - name: Check the proxy handled the downloads
+        env:
+          PROXY: ${{ steps.unstuck.outputs.proxy-url }}
+        run: |
+          # Wait for cache uploads to finish before the offline check.
+          for i in $(seq 60); do
+            curl -sf "$PROXY/_stats" > stats.json
+            jq -e '.in_flight == 0' stats.json > /dev/null && break
+            sleep 1
+          done
+          cat stats.json
+          jq -e '.misses > 0 and .failovers > 0 and .cache_writes > 0 and .errors == 0' stats.json
+
+      # Every mirror unreachable: the reinstall must come from the cache alone,
+      # with InRelease served stale. A second proxy is started directly, since
+      # the action reuses the running one.
+      - name: Reinstall from the cache only
+        run: |
+          "$UNSTUCK_PROXY_BIN" --port-file offline.addr --cache s3://apt-cache/e2e --cache-prefix e2e \
+            --mirrors "$DEAD_MIRRORS" --rounds 1 > "$RUNNER_TEMP/offline.log" 2>&1 &
+          for i in $(seq 50); do test -s offline.addr && break; sleep 0.1; done
+          proxy="http://$(cat offline.addr)"
+          opts=(-o Acquire::http::Proxy-Auto-Detect= -o "Acquire::http::Proxy=$proxy" -o Acquire::Retries=0)
+          sudo apt-get clean
+          sudo apt-get "${opts[@]}" update
+          sudo apt-get "${opts[@]}" install --reinstall -y ghostscript
+          curl -sf "$proxy/_stats" | tee stats.json
+          jq -e '.hits > 0 and .stale > 0' stats.json
+      - if: always()
+        run: |
+          cat "$RUNNER_TEMP/slow-mirror.log" "$RUNNER_TEMP/offline.log" || true
+
+  # Default inputs, and no release for the ref: the action builds the proxy with cargo.
+  e2e-defaults:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -170,10 +173,33 @@ jobs:
         with:
           workspaces: proxy
           key: action-build
-      - id: install
+      - id: unstuck
         uses: ./
-        with:
-          packages: sl
       - run: |
-          /usr/games/sl -h 2>/dev/null || test -x /usr/games/sl
-          test "${{ steps.install.outputs.cache-misses }}" -gt 0
+          sudo apt-get update
+          sudo apt-get install -y sl
+          curl -sf "${{ steps.unstuck.outputs.proxy-url }}/_stats" | tee stats.json
+          jq -e '.misses > 0' stats.json
+
+  # In a container job the action, the proxy and apt all run inside the
+  # container, as root and without ca-certificates.
+  e2e-container:
+    needs: build
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: unstuck-proxy-x86_64
+          path: /opt/unstuck-bin
+      - run: |
+          chmod +x /opt/unstuck-bin/unstuck-proxy
+          echo "UNSTUCK_PROXY_BIN=/opt/unstuck-bin/unstuck-proxy" >> "$GITHUB_ENV"
+      - id: unstuck
+        uses: ./
+      - run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl jq sl
+          curl -sf "${{ steps.unstuck.outputs.proxy-url }}/_stats" | tee stats.json
+          jq -e '.misses > 0' stats.json

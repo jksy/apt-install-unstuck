@@ -1,7 +1,8 @@
 # apt-install-unstuck
 
-A GitHub Action that installs apt packages on GitHub-hosted Ubuntu runners
-without getting stuck on a misbehaving mirror.
+A GitHub Action that keeps `apt-get` on GitHub-hosted Ubuntu runners from
+getting stuck on a misbehaving mirror. Add one step; your existing `apt-get`
+commands stay as they are.
 
 ## The problem
 
@@ -11,11 +12,34 @@ of KB/s, or a connection is accepted and then never answers. `apt-get` has no
 notion of "too slow" and waits, so a job that normally installs packages in
 20 seconds hangs for many minutes or until the job times out.
 
+## Usage
+
+```yaml
+- uses: jksy/apt-install-unstuck@v1
+- run: sudo apt-get update && sudo apt-get install -y ghostscript imagemagick
+```
+
+Every `apt-get` after the action, in any later step of the job, downloads Ubuntu
+packages through the proxy. To stop using it, remove the step.
+
 ## How it works
 
 The action starts a small HTTP forward proxy (`unstuck-proxy`, written in Rust)
-inside the job and runs `apt-get` with `-o Acquire::http::Proxy=...` (and
-`-o Acquire::https::Proxy=DIRECT`) on each command. The proxy:
+that runs until the end of the job, and adds one apt setting,
+`Acquire::http::Proxy-Auto-Detect`, in `/etc/apt/apt.conf.d/99apt-install-unstuck`.
+For each host it connects to, apt asks a small hook installed under
+`/usr/local/lib/apt-install-unstuck/` which proxy to use:
+
+- Ubuntu archive hosts (see [Mirrors](#mirrors)) go through the proxy.
+- Every other host, including HTTPS sources, PPAs and vendor repositories, goes
+  `DIRECT`, exactly as without the action.
+- If the proxy is not answering, everything goes `DIRECT`.
+
+The action's post step removes the setting and the hook and stops the proxy,
+after waiting for pending cache writes. `sources.list` and `apt-mirrors.txt` are
+not touched.
+
+The proxy:
 
 - **Switches mirrors when a transfer stalls.** If response headers do not arrive
   within 15 s, or the average rate over the last 20 s drops below 50 KiB/s, it
@@ -28,48 +52,34 @@ inside the job and runs `apt-get` with `-o Acquire::http::Proxy=...` (and
   upstream. Release files (`InRelease`, ...) are always fetched fresh, and only
   served from the cache when every mirror fails.
 
-The runner's global apt configuration (`sources.list`, `apt.conf.d`,
-`apt-mirrors.txt`) is never modified. Only the commands run by this action (or
-commands you point at `proxy-url`) use the proxy.
+Calling the action again later in the same job reuses the running proxy; the
+inputs of the later call are ignored.
 
-## Usage
-
-```yaml
-- uses: jksy/apt-install-unstuck@v1
-  with:
-    packages: ghostscript imagemagick
-```
-
-This runs `apt-get update` and `apt-get install -y --no-install-recommends ghostscript imagemagick`
-through the proxy, then stops it and writes a summary to the job page.
+If apt already has an HTTP proxy configured (for example a corporate proxy on a
+self-hosted runner), the action leaves that configuration alone, prints a
+warning, and only starts the proxy; use `proxy-url` to opt in explicitly.
 
 ### Inputs
 
 | Input | Default | Description |
 |---|---|---|
-| `packages` | | Packages to install, separated by whitespace. When empty, only the proxy is started. |
 | `cache` | `none` | `none`, `s3://bucket/prefix`, or a local directory. |
 | `cache-key-prefix` | `${ImageOS}-${ImageVersion}-${arch}` | Key prefix inside the cache. |
 | `mirrors` | | Upstreams per archive (see below). |
 | `min-rate` | `50K` | Minimum transfer rate in bytes/s (`K` and `M` are KiB and MiB). |
 | `stall-timeout` | `20` | Seconds below `min-rate` before switching mirrors. |
 | `rounds` | `2` | How many times to go through the mirror list. |
-| `update` | `true` | Run `apt-get update` first. |
-| `install-recommends` | `false` | Install recommended packages. |
-| `lock-timeout` | `120` | Seconds to wait for the dpkg lock. |
-| `attempt-timeout` | `900` | Upper bound in seconds for each `apt-get` command. |
-| `keep-running` | `false` | Keep the proxy running until the end of the job. |
 | `listen` | `127.0.0.1:0` | Address the proxy listens on (port 0 picks a free port). |
 
 ### Outputs
 
 | Output | Description |
 |---|---|
-| `proxy-url` | URL of the proxy, when `keep-running` is set. |
+| `proxy-url` | URL of the proxy, for tools that do not read the apt configuration (e.g. `docker build`). |
 | `proxy-port` | Port the proxy listens on. |
-| `cache-hits` | Requests served from the cache. |
-| `cache-misses` | Requests fetched from upstream mirrors. |
-| `failovers` | Times the proxy switched to another mirror. |
+
+The post step writes request counts, cache hits and mirror failovers to the job
+summary. While the job runs, `GET <proxy-url>/_stats` returns them as JSON.
 
 ### Mirrors
 
@@ -110,14 +120,14 @@ permissions:
   contents: read
 
 steps:
-  - uses: aws-actions/configure-aws-credentials@v5
+  - uses: aws-actions/configure-aws-credentials@v6
     with:
       role-to-assume: arn:aws:iam::123456789012:role/apt-cache
       aws-region: ap-northeast-1
   - uses: jksy/apt-install-unstuck@v1
     with:
-      packages: ghostscript
       cache: s3://my-apt-cache/apt
+  - run: sudo apt-get update && sudo apt-get install -y ghostscript
 ```
 
 ### Cloudflare R2
@@ -130,7 +140,6 @@ steps:
       AWS_REGION: auto
       AWS_ENDPOINT_URL: https://<account-id>.r2.cloudflarestorage.com
     with:
-      packages: ghostscript
       cache: s3://my-apt-cache/apt
 ```
 
@@ -186,30 +195,30 @@ R2 offers the same rules under the bucket's *Object lifecycle rules* settings.
 ### Local directory with actions/cache
 
 ```yaml
-  - uses: actions/cache@v4
+  - uses: actions/cache@v6
     with:
       path: ~/.cache/apt-unstuck
-      key: apt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/apt-packages.txt') }}
+      key: apt-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+      restore-keys: apt-${{ runner.os }}-${{ runner.arch }}-
   - uses: jksy/apt-install-unstuck@v1
     with:
-      packages: ghostscript
       cache: ~/.cache/apt-unstuck
+  - run: sudo apt-get update && sudo apt-get install -y ghostscript
 ```
 
-## Using the proxy from later steps and `docker build`
+Post steps run in reverse order, so the proxy finishes writing the directory
+before actions/cache saves it.
 
-With `keep-running: true` the proxy keeps running until the end of the job, and
-pending cache writes are flushed in the action's post step.
+## Using the proxy from `docker build`
+
+apt inside a container does not read the runner's apt configuration. Pass the
+proxy explicitly:
 
 ```yaml
   - id: apt
     uses: jksy/apt-install-unstuck@v1
     with:
-      keep-running: true
       listen: 0.0.0.0:3142
-  - run: |
-      sudo apt-get -o Acquire::http::Proxy=${{ steps.apt.outputs.proxy-url }} \
-        -o Acquire::https::Proxy=DIRECT install -y ghostscript
   - run: |
       docker build --network host \
         --build-arg http_proxy=http://127.0.0.1:3142 \
@@ -228,11 +237,22 @@ self-hosted runners.
 `http_proxy` makes every HTTP request in the build use the proxy. Requests for
 hosts outside the archive table are relayed without caching or mirror switching.
 
+In a [container job](https://docs.github.com/actions/using-jobs/running-jobs-in-a-container)
+(`container:`), the action runs inside the container and configures the
+container's apt, so no extra setup is needed there.
+
+To send an `apt-get` command to a different proxy explicitly, disable the hook
+for that command: apt prefers `Proxy-Auto-Detect` over `Acquire::http::Proxy`.
+
+```sh
+sudo apt-get -o Acquire::http::Proxy-Auto-Detect= -o Acquire::http::Proxy=http://other:3128 update
+```
+
 ## Limitations
 
-- Only `http://` apt sources go through the proxy. HTTPS sources (PPAs on
-  `ppa.launchpadcontent.net`, vendor repositories, ...) are fetched by apt
-  directly, as before. When you point apt at `proxy-url` yourself, also pass
+- Only `http://` Ubuntu archive sources go through the proxy. HTTPS sources
+  and other hosts are fetched by apt directly, as before. When you point apt at
+  `proxy-url` yourself with `Acquire::http::Proxy`, also pass
   `-o Acquire::https::Proxy=DIRECT`: without it apt sends HTTPS sources to the
   proxy as `CONNECT` requests, which the proxy rejects.
 - Only the Ubuntu archives listed above get mirror switching and caching. Other

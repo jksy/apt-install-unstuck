@@ -2,17 +2,11 @@
 // Shared helpers for main.js and post.js. Plain Node.js, no dependencies.
 
 const fs = require('fs');
+const { spawnSync } = require('child_process');
 
 function input(name, fallback = '') {
   const v = process.env[`INPUT_${name.replace(/ /g, '_').toUpperCase()}`];
   return v === undefined || v.trim() === '' ? fallback : v.trim();
-}
-
-function boolInput(name, fallback) {
-  const v = input(name, String(fallback)).toLowerCase();
-  if (['true', 'yes', '1'].includes(v)) return true;
-  if (['false', 'no', '0'].includes(v)) return false;
-  throw new Error(`input ${name} must be true or false, got "${v}"`);
 }
 
 function appendCommandFile(envName, text) {
@@ -43,16 +37,22 @@ function isAlive(pid) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Runs a command as root (directly when already root, e.g. in a container job).
+function asRoot(cmd, args) {
+  const isRoot = process.getuid && process.getuid() === 0;
+  const [file, argv] = isRoot ? [cmd, args] : ['sudo', ['-n', cmd, ...args]];
+  const r = spawnSync(file, argv, { stdio: ['ignore', 'inherit', 'inherit'] });
+  if (r.error) throw new Error(`cannot run ${file}: ${r.error.message}`);
+  if (r.status !== 0) throw new Error(`${[file, ...argv].join(' ')} exited with code ${r.status}`);
+}
+
 // Sends SIGTERM and waits for the process to exit; SIGKILL after the timeout.
-// Pass `child` when the proxy is our own child: it stays a zombie until Node
-// reaps it, so its exit status is the reliable signal there.
-async function stopProxy(pid, timeoutMs, child) {
+async function stopProxy(pid, timeoutMs) {
   if (!isAlive(pid)) return;
-  const gone = child ? () => child.exitCode !== null || child.signalCode !== null : () => !isAlive(pid);
   process.kill(pid, 'SIGTERM');
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (gone()) return;
+    if (!isAlive(pid)) return;
     await sleep(200);
   }
   console.log(`::warning::unstuck-proxy did not stop within ${timeoutMs / 1000}s; killing it`);
@@ -80,16 +80,13 @@ function fmtBytes(n) {
   return `${i === 0 ? n : n.toFixed(1)} ${units[i]}`;
 }
 
-// Reads the stats file and writes outputs and the step summary.
+// Reads the stats file and writes the step summary.
 function report(statsFile) {
   if (!statsFile || !fs.existsSync(statsFile)) {
     console.log('::warning::unstuck-proxy did not write statistics');
     return null;
   }
   const s = JSON.parse(fs.readFileSync(statsFile, 'utf8'));
-  setOutput('cache-hits', s.hits);
-  setOutput('cache-misses', s.misses);
-  setOutput('failovers', s.failovers);
   console.log(
     `unstuck-proxy: hits=${s.hits} misses=${s.misses} stale=${s.stale} passthrough=${s.passthrough} ` +
       `errors=${s.errors} failovers=${s.failovers}`,
@@ -116,4 +113,22 @@ function report(statsFile) {
   return s;
 }
 
-module.exports = { input, boolInput, setOutput, saveState, getState, isAlive, sleep, stopProxy, printLog, report };
+// Files installed outside RUNNER_TEMP: apt runs the detect hook as the _apt
+// user, which cannot read the runner's home directory.
+const INSTALL_DIR = '/usr/local/lib/apt-install-unstuck';
+const APT_CONF = '/etc/apt/apt.conf.d/99apt-install-unstuck';
+
+module.exports = {
+  INSTALL_DIR,
+  APT_CONF,
+  input,
+  setOutput,
+  saveState,
+  getState,
+  isAlive,
+  sleep,
+  asRoot,
+  stopProxy,
+  printLog,
+  report,
+};

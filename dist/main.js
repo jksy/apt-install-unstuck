@@ -1,5 +1,6 @@
 'use strict';
-// Starts unstuck-proxy, runs apt-get through it, and stops it unless keep-running is set.
+// Starts unstuck-proxy for the rest of the job and makes it apt's proxy for
+// Ubuntu archives through Acquire::http::Proxy-Auto-Detect.
 // Plain Node.js with no dependencies, so the action needs no bundling.
 
 const fs = require('fs');
@@ -114,6 +115,15 @@ function health(url) {
   });
 }
 
+// Address clients should connect to, from the address the proxy listens on.
+function connectAddress(listenAddr) {
+  const i = listenAddr.lastIndexOf(':');
+  let host = listenAddr.slice(0, i).replace(/^\[|\]$/g, '');
+  const port = listenAddr.slice(i + 1);
+  if (host === '0.0.0.0' || host === '::') host = '127.0.0.1';
+  return { host: host.includes(':') ? `[${host}]` : host, port };
+}
+
 async function startProxy(bin, args, workDir) {
   const portFile = path.join(workDir, 'port');
   const logFile = path.join(workDir, 'proxy.log');
@@ -131,10 +141,9 @@ async function startProxy(bin, args, workDir) {
   while (Date.now() < deadline) {
     if (child.exitCode !== null) break;
     if (fs.existsSync(portFile)) {
-      const addr = fs.readFileSync(portFile, 'utf8').trim();
-      const port = addr.slice(addr.lastIndexOf(':') + 1);
-      const url = `http://127.0.0.1:${port}`;
-      if (await health(url)) return { child, url, port, logFile };
+      const { host, port } = connectAddress(fs.readFileSync(portFile, 'utf8').trim());
+      const url = `http://${host}:${port}`;
+      if (await health(url)) return { url, host, port };
     }
     await c.sleep(100);
   }
@@ -146,42 +155,92 @@ async function startProxy(bin, args, workDir) {
   );
 }
 
-function aptGet(args, timeoutSec) {
-  const sudo = process.getuid && process.getuid() === 0 ? [] : ['sudo'];
-  const cmd = [
-    'timeout',
-    '--signal=INT',
-    '--kill-after=10',
-    String(timeoutSec),
-    ...sudo,
-    'env',
-    'DEBIAN_FRONTEND=noninteractive',
-    'apt-get',
-    ...args,
-  ];
-  console.log(`[command]${cmd.join(' ')}`);
-  const r = spawnSync(cmd[0], cmd.slice(1), { stdio: 'inherit' });
-  if (r.error) throw r.error;
-  if (r.status === 124 || r.status === 137) {
-    throw new Error(`apt-get ${args.find((a) => !a.startsWith('-') && !a.includes('='))} timed out after ${timeoutSec}s`);
+// The proxy started by an earlier step of this job, if it is still running.
+async function runningProxy() {
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(c.INSTALL_DIR, 'state.json'), 'utf8'));
+    if (state.url && (await health(state.url))) return state;
+  } catch (_) {
+    // not set up yet
   }
-  if (r.status !== 0) throw new Error(`apt-get exited with code ${r.status}`);
+  return null;
+}
+
+// Other proxy settings for http (a corporate proxy on a self-hosted runner,
+// for example) would be overridden by Proxy-Auto-Detect, so leave them alone.
+function existingAptProxyConfig() {
+  const r = spawnSync('apt-config', ['dump'], { encoding: 'utf8' });
+  if (r.status !== 0) return [];
+  return r.stdout.split('\n').filter((l) => /^Acquire::http::(Proxy|ProxyAutoDetect)\b/.test(l));
+}
+
+function installFile(workDir, name, contents, mode, dest) {
+  const src = path.join(workDir, name);
+  fs.writeFileSync(src, contents);
+  c.asRoot('install', ['-m', mode, src, dest]);
+}
+
+function configureApt(workDir, proxy) {
+  const hook = path.join(c.INSTALL_DIR, 'apt-proxy-detect');
+  installFile(
+    workDir,
+    'apt-proxy-detect',
+    [
+      '#!/bin/sh',
+      '# Installed by apt-install-unstuck for Acquire::http::Proxy-Auto-Detect.',
+      '# apt treats a failing hook as an error, so fall back to DIRECT on any problem.',
+      `bin=${c.INSTALL_DIR}/unstuck-proxy`,
+      `[ -x "$bin" ] && "$bin" apt-detect --proxy ${proxy.host}:${proxy.port} "$1" 2>/dev/null || echo DIRECT`,
+      '',
+    ].join('\n'),
+    '0755',
+    hook,
+  );
+  // Written last and removed first, so apt never points at a missing hook.
+  installFile(
+    workDir,
+    'apt.conf',
+    [
+      '// Installed by apt-install-unstuck; removed at the end of the job.',
+      '// Ubuntu archive requests go through unstuck-proxy, everything else DIRECT.',
+      `Acquire::http::Proxy-Auto-Detect "${hook}";`,
+      '',
+    ].join('\n'),
+    '0644',
+    c.APT_CONF,
+  );
+  c.saveState('apt_conf', 'true');
 }
 
 async function run() {
-  const packages = c.input('packages').split(/\s+/).filter(Boolean);
-  const keepRunning = c.boolInput('keep-running', false);
-  const update = c.boolInput('update', true);
-  const recommends = c.boolInput('install-recommends', false);
-  const lockTimeout = c.input('lock-timeout', '120');
-  const attemptTimeout = c.input('attempt-timeout', '900');
+  const reused = await runningProxy();
+  if (reused) {
+    console.log(`unstuck-proxy is already running at ${reused.url} (set up by an earlier step); reusing it`);
+    console.log('Inputs of this step are ignored.');
+    c.setOutput('proxy-url', reused.url);
+    c.setOutput('proxy-port', reused.port);
+    return;
+  }
+  if (!fs.existsSync('/etc/apt/apt.conf.d')) {
+    throw new Error('apt-install-unstuck needs apt (/etc/apt/apt.conf.d not found)');
+  }
+  // Left behind by a job whose post step did not run (self-hosted runners).
+  if (fs.existsSync(c.APT_CONF)) {
+    console.log(`Removing stale ${c.APT_CONF}`);
+    c.asRoot('rm', ['-f', c.APT_CONF]);
+  }
 
   const workDir = fs.mkdtempSync(path.join(tempRoot(), 'unstuck-proxy-'));
   const statsFile = path.join(workDir, 'stats.json');
-  c.saveState('stats_file', statsFile);
   fs.mkdirSync(path.join(workDir, 'tmp'));
 
-  const bin = await resolveBinary();
+  const built = await resolveBinary();
+  const bin = path.join(c.INSTALL_DIR, 'unstuck-proxy');
+  c.asRoot('install', ['-d', '-m', '0755', c.INSTALL_DIR]);
+  c.asRoot('install', ['-m', '0755', built, bin]);
+  c.saveState('owner', 'true');
+  c.saveState('stats_file', statsFile);
+
   const args = [
     '--listen', c.input('listen', '127.0.0.1:0'),
     '--stats-file', statsFile,
@@ -196,37 +255,22 @@ async function run() {
   if (mirrors) args.push('--mirrors', mirrors);
 
   const proxy = await startProxy(bin, args, workDir);
+  installFile(workDir, 'state.json', JSON.stringify({ url: proxy.url, port: proxy.port }), '0644',
+    path.join(c.INSTALL_DIR, 'state.json'));
   console.log(`unstuck-proxy is running at ${proxy.url}`);
+  c.setOutput('proxy-url', proxy.url);
   c.setOutput('proxy-port', proxy.port);
 
-  let failure;
-  try {
-    if (packages.length) {
-      const opts = [
-        '-o', `Acquire::http::Proxy=${proxy.url}`,
-        // apt would otherwise send HTTPS sources to the same proxy via CONNECT.
-        '-o', 'Acquire::https::Proxy=DIRECT',
-        '-o', `DPkg::Lock::Timeout=${lockTimeout}`,
-        '-o', 'Acquire::Retries=3',
-      ];
-      if (update) aptGet([...opts, 'update'], attemptTimeout);
-      const install = [...opts, 'install', '-y'];
-      if (!recommends) install.push('--no-install-recommends');
-      aptGet([...install, ...packages], attemptTimeout);
-    }
-  } catch (e) {
-    failure = e;
+  const existing = existingAptProxyConfig();
+  if (existing.length) {
+    console.log(
+      `::warning::apt already has a proxy configured (${existing.join('; ')}); ` +
+        'leaving it in place. Use the proxy-url output to send apt through unstuck-proxy explicitly.',
+    );
+    return;
   }
-
-  if (keepRunning) {
-    c.setOutput('proxy-url', proxy.url);
-  } else {
-    await c.stopProxy(proxy.child.pid, 40_000, proxy.child);
-    c.saveState('stopped', 'true');
-    c.printLog(proxy.logFile);
-    c.report(statsFile);
-  }
-  if (failure) throw failure;
+  configureApt(workDir, proxy);
+  console.log(`apt now sends Ubuntu archive requests through unstuck-proxy (${c.APT_CONF})`);
 }
 
 run().catch((e) => {
