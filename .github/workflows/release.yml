@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - uses: mlugg/setup-zig@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build static binaries
+        working-directory: proxy
+        run: cargo zigbuild --release --locked --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
+      - name: Collect assets
+        run: |
+          mkdir assets
+          for arch in x86_64 aarch64; do
+            cp "proxy/target/$arch-unknown-linux-musl/release/unstuck-proxy" "assets/unstuck-proxy-$arch-linux"
+          done
+          (cd assets && sha256sum unstuck-proxy-* > SHA256SUMS && cat SHA256SUMS)
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" assets/* --verify-tag --generate-notes --title "$TAG"
+      # The action downloads the binary from the release named after its ref,
+      # so `uses: owner/repo@v1` needs a `v1` release that follows the latest v1.x.y.
+      - name: Update major version tag and release
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          major="${TAG%%.*}"
+          gh release delete "$major" --yes 2>/dev/null || true
+          git tag -f "$major" "$TAG^{commit}"
+          git push -f origin "refs/tags/$major"
+          gh release create "$major" assets/* --verify-tag --latest=false \
+            --title "$major" --notes "Same binaries as $TAG. This release follows the latest $major.x.y."
