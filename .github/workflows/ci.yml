@@ -118,8 +118,11 @@ jobs:
           cache-key-prefix: e2e
           mirrors: ${{ env.SLOW_MIRRORS }}
           stall-timeout: 3
+          fail-on-error: true
       - id: again
         uses: ./
+        with:
+          fail-on-error: true
       - name: Check the second call reused the proxy
         run: test "${{ steps.again.outputs.proxy-url }}" = "${{ steps.unstuck.outputs.proxy-url }}"
 
@@ -175,6 +178,8 @@ jobs:
           key: action-build
       - id: unstuck
         uses: ./
+        with:
+          fail-on-error: true
       - run: |
           sudo apt-get update
           sudo apt-get install -y sl
@@ -198,6 +203,8 @@ jobs:
           echo "UNSTUCK_PROXY_BIN=/opt/unstuck-bin/unstuck-proxy" >> "$GITHUB_ENV"
       - id: unstuck
         uses: ./
+        with:
+          fail-on-error: true
       - run: |
           apt-get update
           apt-get install -y --no-install-recommends curl jq sl

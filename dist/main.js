@@ -273,7 +273,18 @@ async function run() {
   console.log(`apt now sends Ubuntu archive requests through unstuck-proxy (${c.APT_CONF})`);
 }
 
+// A failure here must not turn into a new reason for the job to fail: nothing
+// that could be left behind makes apt worse off than without the action. The
+// apt configuration is written last, and its hook falls back to DIRECT when the
+// proxy is not answering; the post step cleans up whatever was installed.
 run().catch((e) => {
   console.log(`::error::${e.message}`);
-  process.exitCode = 1;
+  if (c.input('fail-on-error', 'false') === 'true') {
+    process.exitCode = 1;
+    return;
+  }
+  console.log(
+    'apt-install-unstuck could not be set up; apt uses its mirrors directly for this job. ' +
+      'Set the fail-on-error input to true to fail the step instead.',
+  );
 });
