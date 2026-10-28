@@ -63,6 +63,12 @@ If apt already has an HTTP proxy configured (for example a corporate proxy on a
 self-hosted runner), the action leaves that configuration alone, prints a
 warning, and only starts the proxy; use `proxy-url` to opt in explicitly.
 
+If the action cannot set itself up (the release binary cannot be downloaded,
+the proxy does not start, ...), the step reports the error as an annotation
+and succeeds, and apt fetches from its mirrors directly as it would without
+the action. The outputs are empty in that case. Set `fail-on-error: true` to
+fail the step instead.
+
 ### Inputs
 
 | Input | Default | Description |
@@ -74,6 +80,7 @@ warning, and only starts the proxy; use `proxy-url` to opt in explicitly.
 | `stall-timeout` | `20` | Seconds below `min-rate` before switching mirrors. |
 | `rounds` | `2` | How many times to go through the mirror list. |
 | `listen` | `127.0.0.1:0` | Address the proxy listens on (port 0 picks a free port). |
+| `fail-on-error` | `false` | Fail the step when the proxy cannot be set up, instead of continuing without it. |
 
 ### Outputs
 
