@@ -5,26 +5,14 @@ updates:
     schedule:
       interval: weekly
 
-  # Tools that CI builds from source (see .github/tools/). go.mod marks
-  # every dependency of a tool module `// indirect`, including the tool
-  # itself, so all of them are allowed explicitly. Their own dependencies
-  # are updated too, so security fixes are not left waiting for an
-  # upstream release. Updates are grouped into one PR per tool.
-  - package-ecosystem: gomod
+  # The official tool images that CI runs, pinned by tag and digest in
+  # the Dockerfiles under .github/tools/.
+  - package-ecosystem: docker
     directories:
       - /.github/tools/actionlint
       - /.github/tools/gitleaks
     schedule:
       interval: weekly
-    allow:
-      - dependency-type: all
-    groups:
-      tools:
-        applies-to: version-updates
-        patterns: ['*']
-      tools-security:
-        applies-to: security-updates
-        patterns: ['*']
 
   - package-ecosystem: github-actions
     directory: /
