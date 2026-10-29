@@ -6,9 +6,10 @@ updates:
       interval: weekly
 
   # Tools that CI builds from source (see .github/tools/). go.mod marks
-  # tool dependencies `// indirect`, which Dependabot skips by default, so
-  # each tool is allowed explicitly. Only the tool itself is bumped; its
-  # own dependencies follow from its go.mod.
+  # every dependency of a tool module `// indirect`, including the tool
+  # itself, so all of them are allowed explicitly. Their own dependencies
+  # are updated too, so security fixes are not left waiting for an
+  # upstream release. Updates are grouped into one PR per tool.
   - package-ecosystem: gomod
     directories:
       - /.github/tools/actionlint
@@ -16,10 +17,14 @@ updates:
     schedule:
       interval: weekly
     allow:
-      - dependency-name: github.com/rhysd/actionlint
-        dependency-type: all
-      - dependency-name: github.com/zricethezav/gitleaks/v8
-        dependency-type: all
+      - dependency-type: all
+    groups:
+      tools:
+        applies-to: version-updates
+        patterns: ['*']
+      tools-security:
+        applies-to: security-updates
+        patterns: ['*']
 
   - package-ecosystem: github-actions
     directory: /
