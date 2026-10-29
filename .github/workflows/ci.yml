@@ -119,7 +119,7 @@ jobs:
           cat /etc/apt/apt-mirrors.txt 2>/dev/null || true
       - name: Wait for MinIO bucket
         run: |
-          for i in $(seq 60); do
+          for _ in $(seq 60); do
             docker exec "${{ job.services.minio.id }}" mc ls local/apt-cache > /dev/null 2>&1 && exit 0
             sleep 1
           done
@@ -127,7 +127,7 @@ jobs:
       - name: Start slow mirror
         run: |
           nohup python3 .github/e2e/slow-mirror.py 8081 2048 > "$RUNNER_TEMP/slow-mirror.log" 2>&1 &
-          for i in $(seq 20); do curl -s -o /dev/null http://127.0.0.1:8081/ && exit 0; sleep 0.5; done
+          for _ in $(seq 20); do curl -s -o /dev/null http://127.0.0.1:8081/ && exit 0; sleep 0.5; done
           exit 1
 
       # A slow mirror sits in front of the origin, so the proxy has to switch
@@ -161,7 +161,7 @@ jobs:
           PROXY: ${{ steps.unstuck.outputs.proxy-url }}
         run: |
           # Wait for cache uploads to finish before the offline check.
-          for i in $(seq 60); do
+          for _ in $(seq 60); do
             curl -sf "$PROXY/_stats" > stats.json
             jq -e '.in_flight == 0' stats.json > /dev/null && break
             sleep 1
@@ -176,7 +176,7 @@ jobs:
         run: |
           "$UNSTUCK_PROXY_BIN" --port-file offline.addr --cache s3://apt-cache/e2e --cache-prefix e2e \
             --mirrors "$DEAD_MIRRORS" --rounds 1 > "$RUNNER_TEMP/offline.log" 2>&1 &
-          for i in $(seq 50); do test -s offline.addr && break; sleep 0.1; done
+          for _ in $(seq 50); do test -s offline.addr && break; sleep 0.1; done
           proxy="http://$(cat offline.addr)"
           opts=(-o Acquire::http::Proxy-Auto-Detect= -o "Acquire::http::Proxy=$proxy" -o Acquire::https::Proxy=DIRECT -o Acquire::Retries=0)
           sudo apt-get clean
