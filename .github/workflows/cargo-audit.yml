@@ -1,0 +1,63 @@
+name: cargo audit
+
+# Not run per PR: a newly published advisory would fail unrelated PRs.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-audit
+      - id: audit
+        name: Audit proxy/Cargo.lock
+        run: |
+          # The exit status is not trusted on its own: it is also non-zero
+          # when the advisory database cannot be fetched.
+          cargo audit --file proxy/Cargo.lock --json > audit.json || true
+          found=$(jq -r '.vulnerabilities.found' audit.json)
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+          cargo audit --file proxy/Cargo.lock --no-fetch | tee audit.txt || true
+          test "$found" = true || test "$found" = false
+      - name: Open or update the advisory issue
+        if: steps.audit.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: 'cargo audit: vulnerable dependencies in proxy/Cargo.lock'
+        run: |
+          {
+            echo "\`cargo audit\` found advisories matching \`proxy/Cargo.lock\` ($RUN_URL)."
+            echo
+            echo '```'
+            head -c 60000 audit.txt
+            echo '```'
+          } > body.md
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 500 \
+            --json number,title --jq "[.[] | select(.title == env.TITLE)][0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body-file body.md
+          else
+            # Only use the label if the repository has it.
+            labels=()
+            if gh label list --repo "$GITHUB_REPOSITORY" --limit 500 --json name \
+                --jq '.[].name' | grep -qx security; then
+              labels=(--label security)
+            fi
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file body.md "${labels[@]}"
+          fi
+      - name: Fail on advisories
+        if: steps.audit.outputs.found == 'true'
+        run: exit 1
