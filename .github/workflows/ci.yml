@@ -61,7 +61,7 @@ jobs:
           workspaces: proxy
           key: musl
       - uses: mlugg/setup-zig@v2.2.1
-      - uses: taiki-e/install-action@v2.88.0
+      - uses: taiki-e/install-action@v2.88.1
         with:
           tool: cargo-zigbuild
       - working-directory: proxy
