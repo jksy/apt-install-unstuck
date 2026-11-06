@@ -55,6 +55,11 @@ The proxy:
   abandons that upstream and continues with the next one. The next mirror is
   fetched from the start and the bytes apt already received are skipped, so apt
   sees one uninterrupted download.
+- **Remembers which mirrors misbehaved.** A mirror that stalled, timed out or
+  failed is tried after the others for every later request until the proxy
+  stops, so one throttled mirror costs at most one stall. Mirrors whose observed
+  rate on larger downloads is below twice `min-rate` are also moved behind the
+  others, even when they never drop low enough to count as stalled.
 - **Optionally caches files** in S3-compatible storage (AWS S3, Cloudflare R2,
   MinIO, ...) or a local directory. Package files (`pool/`) and `by-hash` indexes
   never change for a given path, so they are served from the cache without asking

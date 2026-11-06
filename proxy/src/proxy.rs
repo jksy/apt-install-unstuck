@@ -182,7 +182,7 @@ async fn handle_archive(
         .map(|c| c.archive_key(ar.def.name, &ar.rel));
     let key = format!("{}/{}", ar.def.name, ar.rel);
     let mut log = LogLine::new(&method, key.clone());
-    let upstreams = app.mirrors.resolve(&ar);
+    let upstreams = app.stats.rank(app.mirrors.resolve(&ar), app.fetch.min_rate);
 
     if ar.class == FileClass::Immutable
         && let (Some(cache), Some(sk)) = (&app.cache, &store_key)
@@ -406,9 +406,18 @@ async fn head_archive(
                     return r;
                 }
                 Ok(Ok(resp)) if resp.status() == StatusCode::NOT_FOUND => not_found += 1,
-                Ok(Ok(resp)) => last_error = format!("status {}", resp.status()),
-                Ok(Err(e)) => last_error = e.to_string(),
-                Err(_) => last_error = "first-byte-timeout".into(),
+                Ok(Ok(resp)) => {
+                    app.stats.penalize(base);
+                    last_error = format!("status {}", resp.status());
+                }
+                Ok(Err(e)) => {
+                    app.stats.penalize(base);
+                    last_error = e.to_string();
+                }
+                Err(_) => {
+                    app.stats.penalize(base);
+                    last_error = "first-byte-timeout".into();
+                }
             }
             app.stats.mirror(base, false);
             log.failovers += 1;
