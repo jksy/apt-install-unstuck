@@ -8,6 +8,8 @@ changelog:
       labels: [bug]
     - title: Documentation
       labels: [documentation]
+    - title: CI
+      labels: [ci]
     - title: Dependencies
       labels: [dependencies, github_actions]
     - title: Other changes
