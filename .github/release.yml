@@ -1,0 +1,14 @@
+# Categories for the notes that `gh release create --generate-notes` writes.
+# A pull request goes under the first category whose labels it has.
+changelog:
+  categories:
+    - title: Features
+      labels: [enhancement]
+    - title: Bug fixes
+      labels: [bug]
+    - title: Documentation
+      labels: [documentation]
+    - title: Dependencies
+      labels: [dependencies, github_actions]
+    - title: Other changes
+      labels: ['*']
