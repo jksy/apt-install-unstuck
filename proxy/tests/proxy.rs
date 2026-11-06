@@ -93,6 +93,70 @@ async fn switching_to_mirror_without_range_support_keeps_content_intact() {
     assert_eq!(proxy.stop()["failovers"], 2);
 }
 
+const DEB2: &str = "pool/main/t/test/test2_1.0_amd64.deb";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mirror_that_stalled_is_tried_last_by_later_requests() {
+    let data = content(400 * 1024, 7);
+    let data2 = content(400 * 1024, 8);
+    let both = files(&[(DEB, &data), (DEB2, &data2)]);
+    let slow = FakeMirror::start(Mode::Slow(20 * 1024), both.clone()).await;
+    let good = FakeMirror::start(Mode::Normal, both).await;
+    let m = mirrors(&[slow.base("/ubuntu/"), good.base("/ubuntu/")]);
+    let proxy = Proxy::start(&args(&["--mirrors", &m]));
+    let client = proxy.client();
+
+    let resp = client.get(deb_url()).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap(), data);
+    let started = Instant::now();
+    let resp = client
+        .get(format!("http://archive.ubuntu.com/ubuntu/{DEB2}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.bytes().await.unwrap(), data2);
+    // Straight to the healthy mirror, without waiting for another stall.
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!((slow.hits(), good.hits()), (1, 2));
+
+    let stats = proxy.stop();
+    assert_eq!(stats["failovers"], 1);
+    assert_eq!(stats["mirrors"][slow.base("/ubuntu/")]["penalty"], 1);
+    assert_eq!(stats["mirrors"][good.base("/ubuntu/")]["penalty"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mirror_just_above_min_rate_is_tried_after_others() {
+    // 150 KiB/s never stalls with --min-rate 100K, but is marked slow.
+    let data = content(400 * 1024, 9);
+    let data2 = content(400 * 1024, 10);
+    let both = files(&[(DEB, &data), (DEB2, &data2)]);
+    let slow = FakeMirror::start(Mode::Slow(150 * 1024), both.clone()).await;
+    let good = FakeMirror::start(Mode::Normal, both).await;
+    let m = mirrors(&[slow.base("/ubuntu/"), good.base("/ubuntu/")]);
+    let proxy = Proxy::start(&args(&["--mirrors", &m]));
+    let client = proxy.client();
+
+    let resp = client.get(deb_url()).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap(), data);
+    assert_eq!((slow.hits(), good.hits()), (1, 0));
+    let resp = client
+        .get(format!("http://archive.ubuntu.com/ubuntu/{DEB2}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.bytes().await.unwrap(), data2);
+    assert_eq!((slow.hits(), good.hits()), (1, 1));
+
+    let stats = proxy.stop();
+    assert_eq!(stats["failovers"], 0);
+    assert_eq!(stats["mirrors"][slow.base("/ubuntu/")]["penalty"], 0);
+    let rate = stats["mirrors"][slow.base("/ubuntu/")]["rate"]
+        .as_u64()
+        .unwrap();
+    assert!(rate < 200 * 1024, "rate {rate}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn not_found_on_first_mirror_falls_back_to_second() {
     let data = content(10_000, 3);

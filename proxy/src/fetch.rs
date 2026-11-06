@@ -4,11 +4,12 @@
 //! pace; every client of that key (the first one included) streams from the
 //! file as it grows. When a transfer stalls, the leader switches to the next
 //! mirror, re-downloads from the start and discards the bytes it already has,
-//! so clients see one uninterrupted body.
+//! so clients see one uninterrupted body. Mirrors that stall or fail are
+//! penalized, and later requests try them last (see [`crate::stats::Stats::rank`]).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -204,8 +205,9 @@ async fn download(app: &App, inflight: &Inflight, job: &FetchJob, p: &mut Progre
                 .send_modify(|s| s.mirror = Some(base.clone()));
             let url = format!("{base}{}", job.rel_encoded);
             match attempt(app, inflight, job, &url, p).await {
-                Ok(()) => {
+                Ok((bytes, elapsed)) => {
                     app.stats.mirror(base, true);
+                    app.stats.observe_rate(base, bytes, elapsed);
                     return Outcome::Complete;
                 }
                 Err(e) => {
@@ -220,6 +222,7 @@ async fn download(app: &App, inflight: &Inflight, job: &FetchJob, p: &mut Progre
                             return Outcome::Failed(msg);
                         }
                         AttemptError::Retry(msg) => {
+                            app.stats.penalize(base);
                             eprintln!("unstuck-proxy: {url}: {msg}");
                             last_error = format!("{url}: {msg}");
                         }
@@ -240,7 +243,7 @@ async fn attempt(
     job: &FetchJob,
     url: &str,
     p: &mut Progress,
-) -> Result<(), AttemptError> {
+) -> Result<(u64, Duration), AttemptError> {
     let cfg = &app.fetch;
     let mut req = app.mirror_client.get(url);
     if let Some(ua) = &job.user_agent {
@@ -293,6 +296,7 @@ async fn attempt(
     // Bytes of this response that were already delivered by a previous upstream.
     let mut skip = p.written;
     let mut received = 0u64;
+    let started = Instant::now();
     let mut monitor = RateMonitor::new(cfg.stall_timeout, cfg.min_rate);
     let mut ticker = tokio::time::interval(CHECK_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -361,7 +365,7 @@ async fn attempt(
         None if skip > 0 => Err(AttemptError::Mismatch(
             "shorter than the data already sent".into(),
         )),
-        _ => Ok(()),
+        _ => Ok((received, started.elapsed())),
     }
 }
 
