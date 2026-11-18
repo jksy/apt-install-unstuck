@@ -52,9 +52,12 @@ The proxy:
 
 - **Switches mirrors when a transfer stalls.** If response headers do not arrive
   within 15 s, or the average rate over the last 20 s drops below 50 KiB/s, it
-  abandons that upstream and continues with the next one. The next mirror is
-  fetched from the start and the bytes apt already received are skipped, so apt
-  sees one uninterrupted download.
+  abandons that upstream and continues with the next one. Package files
+  (`pool/`, `by-hash`) continue where the previous mirror stopped, using a
+  `Range` request; other files, and mirrors that do not support `Range`, are
+  fetched again from the start. Either way apt sees one uninterrupted download.
+  Once every mirror has failed for a file, the proxy stops switching and keeps
+  a slow transfer as long as data keeps arriving.
 - **Remembers which mirrors misbehaved.** A mirror that stalled, timed out or
   failed is tried after the others for every later request until the proxy
   stops, so one throttled mirror costs at most one stall. Mirrors whose observed
@@ -280,8 +283,10 @@ sudo apt-get -o Acquire::http::Proxy-Auto-Detect= -o Acquire::http::Proxy=http:/
 - Only the Ubuntu archives listed above get mirror switching and caching. Other
   distributions (Debian, ...) are not supported yet; their requests are relayed
   as-is.
-- The proxy does not send `Range` requests upstream. A switch costs re-reading
-  the part of the file that was already delivered.
+- When a mirror that answers with the whole file takes over, the proxy keeps
+  that mirror's copy (for the cache) but cannot take back the part apt has
+  already received. If two mirrors serve different content under the same path,
+  apt rejects that download with a hash mismatch and fetches it again.
 
 ## Development
 
