@@ -93,6 +93,93 @@ async fn switching_to_mirror_without_range_support_keeps_content_intact() {
     assert_eq!(proxy.stop()["failovers"], 2);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_but_moving_mirror_is_kept_when_nothing_better_is_left() {
+    // 60 KiB/s is below --min-rate 100K, so this mirror is abandoned once. The
+    // other one is slower still; after it fails too, the first one is kept.
+    let data = content(200 * 1024, 11);
+    let throttled = FakeMirror::start(Mode::Slow(60 * 1024), files(&[(DEB, &data)])).await;
+    let crawling = FakeMirror::start(Mode::Slow(2 * 1024), files(&[(DEB, &data)])).await;
+    let m = mirrors(&[throttled.base("/ubuntu/"), crawling.base("/ubuntu/")]);
+    let proxy = Proxy::start(&args(&["--mirrors", &m]));
+
+    let body = proxy
+        .client()
+        .get(deb_url())
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(body, data);
+    assert_eq!((throttled.hits(), crawling.hits()), (2, 1));
+    let stats = proxy.stop();
+    assert_eq!(stats["failovers"], 2);
+    assert_eq!(stats["errors"], 0);
+    assert_eq!(stats["mirrors"][throttled.base("/ubuntu/")]["success"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failover_resumes_immutable_files_with_range() {
+    let data = content(300_000, 12);
+    let cases = [
+        // Immutable: the second mirror only sends the missing part.
+        (DEB, 300_000),
+        // Mutable: always fetched whole from the next mirror.
+        (IN_RELEASE, 100_000 + 300_000),
+    ];
+    for (path, upstream_bytes) in cases {
+        let truncating = FakeMirror::start(Mode::Truncate(100_000), files(&[(path, &data)])).await;
+        let good = FakeMirror::start(Mode::Normal, files(&[(path, &data)])).await;
+        let m = mirrors(&[truncating.base("/ubuntu/"), good.base("/ubuntu/")]);
+        let proxy = Proxy::start(&args(&["--mirrors", &m]));
+        let body = proxy
+            .client()
+            .get(format!("http://archive.ubuntu.com/ubuntu/{path}"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(body, data, "{path}");
+        let stats = proxy.stop();
+        assert_eq!(stats["failovers"], 1, "{path}");
+        assert_eq!(stats["bytes_from_upstream"], upstream_bytes, "{path}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn whole_file_from_next_mirror_replaces_what_was_fetched() {
+    let cache = tempfile::tempdir().unwrap();
+    let cache_url = format!("file://{}", cache.path().display());
+    // Same length, different content: only the second mirror's copy may be cached.
+    let first = content(300_000, 13);
+    let second = content(300_000, 14);
+    let truncating = FakeMirror::start(Mode::Truncate(100_000), files(&[(DEB, &first)])).await;
+    let norange = FakeMirror::start(Mode::NoRange, files(&[(DEB, &second)])).await;
+    let m = mirrors(&[truncating.base("/ubuntu/"), norange.base("/ubuntu/")]);
+    let proxy = Proxy::start(&args(&["--mirrors", &m, "--cache", &cache_url]));
+
+    let body = proxy
+        .client()
+        .get(deb_url())
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    // The client already had the first part, so its copy is mixed.
+    assert_eq!(body[..100_000], first[..100_000]);
+    assert_eq!(body[100_000..], second[100_000..]);
+    let stats = proxy.stop();
+    assert_eq!(stats["cache_writes"], 1);
+    let stored = cache.path().join("default/ubuntu").join(DEB);
+    assert_eq!(std::fs::read(&stored).unwrap(), second);
+}
+
 const DEB2: &str = "pool/main/t/test/test2_1.0_amd64.deb";
 
 #[tokio::test(flavor = "multi_thread")]

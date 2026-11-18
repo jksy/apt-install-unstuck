@@ -8,7 +8,8 @@ pub const CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct RateMonitor {
     window: Duration,
-    min_rate: u64,
+    /// Fewer bytes than this within one window is a stall.
+    min_bytes: f64,
     start: Instant,
     total: u64,
     samples: VecDeque<(Instant, u64)>,
@@ -16,10 +17,19 @@ pub struct RateMonitor {
 
 impl RateMonitor {
     pub fn new(window: Duration, min_rate: u64) -> Self {
+        Self::with_min_bytes(window, min_rate as f64 * window.as_secs_f64())
+    }
+
+    /// Only a window in which no bytes arrived at all counts as a stall.
+    pub fn idle(window: Duration) -> Self {
+        Self::with_min_bytes(window, 1.0)
+    }
+
+    fn with_min_bytes(window: Duration, min_bytes: f64) -> Self {
         let start = Instant::now();
         Self {
             window,
-            min_rate,
+            min_bytes,
             start,
             total: 0,
             samples: VecDeque::from([(start, 0)]),
@@ -30,14 +40,14 @@ impl RateMonitor {
         self.total += n as u64;
     }
 
-    /// True when the average rate over the last `window` is below `min_rate`.
+    /// True when the average rate over the last `window` is below the minimum.
     /// Never fires before a full window has elapsed.
     pub fn stalled(&mut self) -> bool {
         self.stalled_at(Instant::now())
     }
 
     fn stalled_at(&mut self, now: Instant) -> bool {
-        if self.min_rate == 0 || self.window.is_zero() {
+        if self.min_bytes <= 0.0 || self.window.is_zero() {
             return false;
         }
         self.samples.push_back((now, self.total));
@@ -49,7 +59,7 @@ impl RateMonitor {
             self.samples.pop_front();
         }
         let bytes = self.total - self.samples[0].1;
-        (bytes as f64) < self.min_rate as f64 * self.window.as_secs_f64()
+        (bytes as f64) < self.min_bytes
     }
 }
 
@@ -68,6 +78,16 @@ mod tests {
         assert!(!m.stalled_at(t0 + Duration::from_secs(3)));
         // The 1000 bytes leave the window after another two seconds.
         assert!(m.stalled_at(t0 + Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn idle_monitor_only_fires_without_any_bytes() {
+        let mut m = RateMonitor::idle(Duration::from_secs(2));
+        let t0 = m.start;
+        m.add(1);
+        assert!(!m.stalled_at(t0 + Duration::from_secs(2)));
+        assert!(!m.stalled_at(t0 + Duration::from_secs(3)));
+        assert!(m.stalled_at(t0 + Duration::from_secs(5)));
     }
 
     #[test]

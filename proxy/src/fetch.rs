@@ -3,9 +3,12 @@
 //! One leader task per key downloads into a temporary file at the upstream's
 //! pace; every client of that key (the first one included) streams from the
 //! file as it grows. When a transfer stalls, the leader switches to the next
-//! mirror, re-downloads from the start and discards the bytes it already has,
-//! so clients see one uninterrupted body. Mirrors that stall or fail are
-//! penalized, and later requests try them last (see [`crate::stats::Stats::rank`]).
+//! mirror and asks for the rest with `Range`; a mirror that answers with the
+//! whole file overwrites the file from the start instead. Either way clients
+//! see one uninterrupted body. Once every mirror has failed in a download, a
+//! slow transfer is kept as long as data keeps arriving. Mirrors that stall or
+//! fail are penalized, and later requests try them last (see
+//! [`crate::stats::Stats::rank`]).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -14,11 +17,11 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use hyper::StatusCode;
-use hyper::header::{self, HeaderValue};
+use hyper::header::{self, HeaderMap, HeaderValue};
 use md5::Md5;
 use sha2::{Digest, Sha256, Sha512};
 use tempfile::TempPath;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
 use crate::archive::{FileClass, HashAlgo};
@@ -113,9 +116,9 @@ impl Hasher {
 
 struct Progress {
     file: tokio::fs::File,
+    /// Bytes clients can read from the temporary file.
     written: u64,
     head: Option<Arc<Head>>,
-    hasher: Option<Hasher>,
 }
 
 /// Returns the in-flight download for `job.key`, starting one if needed.
@@ -137,7 +140,6 @@ pub fn join_or_start(app: &Arc<App>, job: FetchJob) -> std::io::Result<Arc<Infli
         file: tokio::fs::File::from_std(file),
         written: 0,
         head: None,
-        hasher: job.by_hash.as_ref().map(|(algo, _)| Hasher::new(*algo)),
     };
     app.tracker
         .spawn(lead(app.clone(), inflight.clone(), job, progress));
@@ -155,14 +157,20 @@ async fn lead(app: Arc<App>, inflight: Arc<Inflight>, job: FetchJob, mut p: Prog
                 job.key, p.written
             );
             save = false;
-        } else if let (Some((_, expected)), Some(hasher)) = (&job.by_hash, p.hasher.take()) {
-            let actual = hasher.hex();
-            if &actual != expected {
-                eprintln!(
-                    "unstuck-proxy: not caching {}: hash mismatch (got {actual})",
-                    job.key
-                );
-                save = false;
+        } else if let Some((algo, expected)) = &job.by_hash {
+            match hash_file(&inflight.path, *algo).await {
+                Ok(actual) if &actual == expected => {}
+                Ok(actual) => {
+                    eprintln!(
+                        "unstuck-proxy: not caching {}: hash mismatch (got {actual})",
+                        job.key
+                    );
+                    save = false;
+                }
+                Err(e) => {
+                    eprintln!("unstuck-proxy: not caching {}: hashing: {e}", job.key);
+                    save = false;
+                }
             }
         }
     }
@@ -189,6 +197,8 @@ async fn download(app: &App, inflight: &Inflight, job: &FetchJob, p: &mut Progre
     let cfg = &app.fetch;
     let mut tried = 0u32;
     let mut last_error = String::from("no upstreams configured");
+    // Upstreams that already failed (404 included) during this download.
+    let mut failed: Vec<&str> = Vec::new();
     for round in 0..cfg.rounds.max(1) {
         if round > 0 {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -204,7 +214,10 @@ async fn download(app: &App, inflight: &Inflight, job: &FetchJob, p: &mut Progre
                 .state
                 .send_modify(|s| s.mirror = Some(base.clone()));
             let url = format!("{base}{}", job.rel_encoded);
-            match attempt(app, inflight, job, &url, p).await {
+            // Every upstream has had its chance; switching again would only
+            // trade this transfer for another one that already failed.
+            let last_viable = job.upstreams.iter().all(|u| failed.contains(&u.as_str()));
+            match attempt(app, inflight, job, &url, last_viable, p).await {
                 Ok((bytes, elapsed)) => {
                     app.stats.mirror(base, true);
                     app.stats.observe_rate(base, bytes, elapsed);
@@ -212,6 +225,7 @@ async fn download(app: &App, inflight: &Inflight, job: &FetchJob, p: &mut Progre
                 }
                 Err(e) => {
                     app.stats.mirror(base, false);
+                    failed.push(base);
                     match e {
                         AttemptError::NotFound => {
                             not_found += 1;
@@ -242,12 +256,23 @@ async fn attempt(
     inflight: &Inflight,
     job: &FetchJob,
     url: &str,
+    last_viable: bool,
     p: &mut Progress,
 ) -> Result<(u64, Duration), AttemptError> {
     let cfg = &app.fetch;
     let mut req = app.mirror_client.get(url);
     if let Some(ua) = &job.user_agent {
         req = req.header(header::USER_AGENT, ua.clone());
+    }
+    // Files under an immutable path are the same on every mirror, so the rest
+    // can come from another one. If-Range makes a mirror whose copy looks
+    // different answer 200 with the whole file instead.
+    let resume = p.written > 0 && job.class == FileClass::Immutable;
+    if resume {
+        req = req.header(header::RANGE, format!("bytes={}-", p.written));
+        if let Some(lm) = p.head.as_ref().and_then(|h| h.last_modified.clone()) {
+            req = req.header(header::IF_RANGE, lm);
+        }
     }
     let resp = match tokio::time::timeout(cfg.first_byte_timeout, req.send()).await {
         Err(_) => {
@@ -258,12 +283,36 @@ async fn attempt(
         Ok(Err(e)) => return Err(AttemptError::Retry(format!("request failed: {e}"))),
         Ok(Ok(r)) => r,
     };
-    match resp.status() {
-        StatusCode::OK => {}
+    // `offset` is where this body starts in the file, `length` the file's full size.
+    let (offset, length) = match resp.status() {
+        StatusCode::OK => (0, resp.content_length()),
+        StatusCode::PARTIAL_CONTENT if resume => {
+            let expected = p.head.as_ref().and_then(|h| h.content_length);
+            match content_range(resp.headers()) {
+                Some((_, _, total)) if Some(total) != expected => {
+                    return Err(AttemptError::Mismatch(format!(
+                        "length {total} differs from {expected:?}"
+                    )));
+                }
+                Some((start, end, total))
+                    if start == p.written
+                        && end + 1 == total
+                        && resp.content_length().is_none_or(|l| l == total - start) =>
+                {
+                    (start, Some(total))
+                }
+                _ => {
+                    return Err(AttemptError::Retry(format!(
+                        "unexpected 206 for bytes={}-: {:?}",
+                        p.written,
+                        resp.headers().get(header::CONTENT_RANGE)
+                    )));
+                }
+            }
+        }
         StatusCode::NOT_FOUND => return Err(AttemptError::NotFound),
         s => return Err(AttemptError::Retry(format!("status {s}"))),
-    }
-    let length = resp.content_length();
+    };
     let last_modified = resp.headers().get(header::LAST_MODIFIED).cloned();
     match &p.head {
         None => {
@@ -293,11 +342,23 @@ async fn attempt(
         }
     }
 
-    // Bytes of this response that were already delivered by a previous upstream.
-    let mut skip = p.written;
+    // A whole-file answer replaces what is in the temporary file, so the file
+    // comes from a single mirror. Clients only see bytes past what they have
+    // already been sent.
+    if let Err(e) = p.file.seek(std::io::SeekFrom::Start(offset)).await {
+        return Err(AttemptError::Mismatch(format!(
+            "seeking temporary file: {e}"
+        )));
+    }
+    let mut pos = offset;
     let mut received = 0u64;
     let started = Instant::now();
-    let mut monitor = RateMonitor::new(cfg.stall_timeout, cfg.min_rate);
+    // With nowhere better to go, a slow transfer is kept as long as it moves.
+    let mut monitor = if last_viable && cfg.min_rate > 0 {
+        RateMonitor::idle(cfg.stall_timeout)
+    } else {
+        RateMonitor::new(cfg.stall_timeout, cfg.min_rate)
+    };
     let mut ticker = tokio::time::interval(CHECK_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut body = resp.bytes_stream();
@@ -306,15 +367,19 @@ async fn attempt(
             c = body.next() => c,
             _ = ticker.tick() => {
                 if monitor.stalled() {
-                    return Err(AttemptError::Retry(format!(
-                        "stalled: below {} B/s for {:?} after {received} bytes",
-                        cfg.min_rate, cfg.stall_timeout
-                    )));
+                    return Err(AttemptError::Retry(if last_viable {
+                        format!("stalled: no data for {:?} after {received} bytes", cfg.stall_timeout)
+                    } else {
+                        format!(
+                            "stalled: below {} B/s for {:?} after {received} bytes",
+                            cfg.min_rate, cfg.stall_timeout
+                        )
+                    }));
                 }
                 continue;
             }
         };
-        let mut chunk: Bytes = match chunk {
+        let chunk: Bytes = match chunk {
             None => break,
             Some(Ok(c)) => c,
             Some(Err(e)) => {
@@ -328,21 +393,10 @@ async fn attempt(
         app.stats
             .bytes_from_upstream
             .fetch_add(chunk.len() as u64, Relaxed);
-        if skip > 0 {
-            let n = skip.min(chunk.len() as u64) as usize;
-            skip -= n as u64;
-            chunk = chunk.slice(n..);
-            if chunk.is_empty() {
-                continue;
-            }
-        }
-        if length.is_some_and(|l| p.written + chunk.len() as u64 > l) {
+        if length.is_some_and(|l| pos + chunk.len() as u64 > l) {
             return Err(AttemptError::Mismatch(
                 "upstream sent more than Content-Length".into(),
             ));
-        }
-        if let Some(h) = &mut p.hasher {
-            h.update(&chunk);
         }
         let write = async {
             p.file.write_all(&chunk).await?;
@@ -353,19 +407,42 @@ async fn attempt(
                 "writing temporary file: {e}"
             )));
         }
-        p.written += chunk.len() as u64;
-        let written = p.written;
-        inflight.state.send_modify(|s| s.written = written);
+        pos += chunk.len() as u64;
+        if pos > p.written {
+            p.written = pos;
+            inflight.state.send_modify(|s| s.written = pos);
+        }
     }
     match length {
-        Some(l) if p.written < l => Err(AttemptError::Retry(format!(
-            "connection closed at {}/{l} bytes",
-            p.written
+        Some(l) if pos < l => Err(AttemptError::Retry(format!(
+            "connection closed at {pos}/{l} bytes"
         ))),
-        None if skip > 0 => Err(AttemptError::Mismatch(
+        None if pos < p.written => Err(AttemptError::Mismatch(
             "shorter than the data already sent".into(),
         )),
         _ => Ok((received, started.elapsed())),
+    }
+}
+
+/// Parses `Content-Range: bytes <start>-<end>/<total>`.
+fn content_range(headers: &HeaderMap) -> Option<(u64, u64, u64)> {
+    let v = headers.get(header::CONTENT_RANGE)?.to_str().ok()?;
+    let (range, total) = v.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
+}
+
+/// Hashes the finished temporary file.
+async fn hash_file(path: &std::path::Path, algo: HashAlgo) -> std::io::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Hasher::new(algo);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(hasher.hex());
+        }
+        hasher.update(&buf[..n]);
     }
 }
 
