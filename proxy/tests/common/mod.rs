@@ -23,6 +23,8 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 pub const LAST_MODIFIED: &str = "Tue, 01 Oct 2024 00:00:00 GMT";
+/// Sent by [`Mode::Outdated`], like a mirror that has not synced yet.
+pub const OLDER_LAST_MODIFIED: &str = "Mon, 30 Sep 2024 00:00:00 GMT";
 
 #[derive(Clone, Copy, Debug)]
 pub enum Mode {
@@ -40,6 +42,8 @@ pub enum Mode {
     NoRange,
     /// Waits before answering normally.
     Delay(Duration),
+    /// Answers like `Normal`, but with [`OLDER_LAST_MODIFIED`].
+    Outdated,
 }
 
 type Body = UnsyncBoxBody<Bytes, std::io::Error>;
@@ -120,8 +124,12 @@ async fn respond<B>(mode: Mode, files: &HashMap<String, Bytes>, req: Request<B>)
         .and_then(|v| v.strip_prefix("bytes="))
         .and_then(|v| v.strip_suffix('-'))
         .and_then(|v| v.parse::<usize>().ok());
+    let last_modified = match mode {
+        Mode::Outdated => OLDER_LAST_MODIFIED,
+        _ => LAST_MODIFIED,
+    };
     let builder = Response::builder()
-        .header("last-modified", LAST_MODIFIED)
+        .header("last-modified", last_modified)
         .header("content-type", "application/octet-stream");
     let head = req.method() == hyper::Method::HEAD;
     match mode {

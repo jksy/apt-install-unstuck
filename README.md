@@ -34,9 +34,11 @@ defaults to `${{ github.token }}`.
 ## How it works
 
 The action starts a small HTTP forward proxy (`unstuck-proxy`, written in Rust)
-that runs until the end of the job, and adds one apt setting,
-`Acquire::http::Proxy-Auto-Detect`, in `/etc/apt/apt.conf.d/99apt-install-unstuck`.
-For each host it connects to, apt asks a small hook installed under
+that runs until the end of the job, and adds two apt settings in
+`/etc/apt/apt.conf.d/99apt-install-unstuck`: `Acquire::http::Proxy-Auto-Detect`,
+and `Acquire::Retries::Delay "false"`, so apt retries a failed download right
+away (a delayed retry can leave apt waiting forever once nothing else is in
+flight). For each host it connects to, apt asks a small hook installed under
 `/usr/local/lib/apt-install-unstuck/` which proxy to use:
 
 - Ubuntu archive hosts (see [Mirrors](#mirrors)) go through the proxy.
@@ -286,7 +288,10 @@ sudo apt-get -o Acquire::http::Proxy-Auto-Detect= -o Acquire::http::Proxy=http:/
 - When a mirror that answers with the whole file takes over, the proxy keeps
   that mirror's copy (for the cache) but cannot take back the part apt has
   already received. If two mirrors serve different content under the same path,
-  apt rejects that download with a hash mismatch and fetches it again.
+  apt rejects that download with a hash mismatch and fetches it again. A mirror
+  whose `Content-Length` (or, for `InRelease` and other files that change in
+  place, `Last-Modified`) differs from what is being sent is skipped for the
+  rest of that download instead.
 
 ## Development
 
