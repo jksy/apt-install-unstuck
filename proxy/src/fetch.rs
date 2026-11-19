@@ -5,10 +5,11 @@
 //! file as it grows. When a transfer stalls, the leader switches to the next
 //! mirror and asks for the rest with `Range`; a mirror that answers with the
 //! whole file overwrites the file from the start instead. Either way clients
-//! see one uninterrupted body. Once every mirror has failed in a download, a
-//! slow transfer is kept as long as data keeps arriving. Mirrors that stall or
-//! fail are penalized, and later requests try them last (see
-//! [`crate::stats::Stats::rank`]).
+//! see one uninterrupted body. A mirror whose copy differs from the one being
+//! sent is left out for the rest of the download. Once every mirror has failed
+//! in a download, a slow transfer is kept as long as data keeps arriving.
+//! Mirrors that stall or fail are penalized, and later requests try them last
+//! (see [`crate::stats::Stats::rank`]).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -77,7 +78,10 @@ pub struct FetchJob {
 
 enum AttemptError {
     NotFound,
-    /// The new upstream serves something different from what was already sent.
+    /// This upstream's copy differs from the one already being sent; the
+    /// download goes on without it.
+    Differs(String),
+    /// The download cannot go on.
     Mismatch(String),
     Retry(String),
 }
@@ -199,12 +203,17 @@ async fn download(app: &App, inflight: &Inflight, job: &FetchJob, p: &mut Progre
     let mut last_error = String::from("no upstreams configured");
     // Upstreams that already failed (404 included) during this download.
     let mut failed: Vec<&str> = Vec::new();
+    // Upstreams whose copy differs from the one being sent; never tried again.
+    let mut differs: Vec<&str> = Vec::new();
     for round in 0..cfg.rounds.max(1) {
         if round > 0 {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         let mut not_found = 0;
         for base in &job.upstreams {
+            if differs.contains(&base.as_str()) {
+                continue;
+            }
             if tried > 0 {
                 app.stats.failovers.fetch_add(1, Relaxed);
                 inflight.state.send_modify(|s| s.failovers += 1);
@@ -230,6 +239,13 @@ async fn download(app: &App, inflight: &Inflight, job: &FetchJob, p: &mut Progre
                         AttemptError::NotFound => {
                             not_found += 1;
                             last_error = format!("{url}: 404");
+                        }
+                        AttemptError::Differs(msg) => {
+                            // Aborting would leave apt to retry, and a delayed
+                            // retry can hang it; another mirror may still finish.
+                            eprintln!("unstuck-proxy: {url}: {msg}; skipping this mirror");
+                            differs.push(base);
+                            last_error = format!("{url}: {msg}");
                         }
                         AttemptError::Mismatch(msg) => {
                             eprintln!("unstuck-proxy: {url}: {msg}; aborting {}", job.key);
@@ -290,7 +306,7 @@ async fn attempt(
             let expected = p.head.as_ref().and_then(|h| h.content_length);
             match content_range(resp.headers()) {
                 Some((_, _, total)) if Some(total) != expected => {
-                    return Err(AttemptError::Mismatch(format!(
+                    return Err(AttemptError::Differs(format!(
                         "length {total} differs from {expected:?}"
                     )));
                 }
@@ -326,7 +342,7 @@ async fn attempt(
         }
         Some(head) => {
             if head.content_length.is_none() || head.content_length != length {
-                return Err(AttemptError::Mismatch(format!(
+                return Err(AttemptError::Differs(format!(
                     "length {length:?} differs from {:?}",
                     head.content_length
                 )));
@@ -335,7 +351,7 @@ async fn attempt(
                 && let (Some(a), Some(b)) = (&head.last_modified, &last_modified)
                 && a != b
             {
-                return Err(AttemptError::Mismatch(format!(
+                return Err(AttemptError::Differs(format!(
                     "Last-Modified {b:?} differs from {a:?}"
                 )));
             }

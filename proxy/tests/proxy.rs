@@ -151,6 +151,34 @@ async fn failover_resumes_immutable_files_with_range() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn mirror_with_a_different_copy_is_skipped_instead_of_aborting() {
+    // The slow mirror is abandoned once; the next one has an older InRelease,
+    // which cannot continue what was sent. The download goes back to the slow
+    // mirror instead of failing the client mid-body.
+    let fresh = content(60 * 1024, 15);
+    let older = content(60 * 1024, 16);
+    let slow = FakeMirror::start(Mode::Slow(30 * 1024), files(&[(IN_RELEASE, &fresh)])).await;
+    let outdated = FakeMirror::start(Mode::Outdated, files(&[(IN_RELEASE, &older)])).await;
+    let m = mirrors(&[slow.base("/ubuntu/"), outdated.base("/ubuntu/")]);
+    let proxy = Proxy::start(&args(&["--mirrors", &m]));
+
+    let resp = proxy
+        .client()
+        .get(format!("http://archive.ubuntu.com/ubuntu/{IN_RELEASE}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()["last-modified"], common::LAST_MODIFIED);
+    assert_eq!(resp.bytes().await.unwrap(), fresh);
+    // Tried once and left out of the second round.
+    assert_eq!((slow.hits(), outdated.hits()), (2, 1));
+    let stats = proxy.stop();
+    assert_eq!(stats["errors"], 0);
+    assert_eq!(stats["mirrors"][slow.base("/ubuntu/")]["success"], 1);
+    assert_eq!(stats["mirrors"][outdated.base("/ubuntu/")]["failure"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn whole_file_from_next_mirror_replaces_what_was_fetched() {
     let cache = tempfile::tempdir().unwrap();
     let cache_url = format!("file://{}", cache.path().display());

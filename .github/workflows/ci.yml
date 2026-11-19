@@ -147,7 +147,9 @@ jobs:
       - name: Check the second call reused the proxy
         run: test "${{ steps.again.outputs.proxy-url }}" = "${{ steps.unstuck.outputs.proxy-url }}"
 
+      # apt can hang instead of failing (#28); fail the step long before the job timeout.
       - name: Install with unchanged apt commands
+        timeout-minutes: 10
         run: |
           sudo apt-get update 2>&1 | tee "$RUNNER_TEMP/update.log"
           if grep -q 'Invalid response from proxy' "$RUNNER_TEMP/update.log"; then
@@ -173,6 +175,7 @@ jobs:
       # with InRelease served stale. A second proxy is started directly, since
       # the action reuses the running one.
       - name: Reinstall from the cache only
+        timeout-minutes: 10
         run: |
           "$UNSTUCK_PROXY_BIN" --port-file offline.addr --cache s3://apt-cache/e2e --cache-prefix e2e \
             --mirrors "$DEAD_MIRRORS" --rounds 1 > "$RUNNER_TEMP/offline.log" 2>&1 &
